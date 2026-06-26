@@ -1625,6 +1625,7 @@ describe("resolveWorkerSparkModel", () => {
   });
 
   it("reads low-complexity team model from config when codexHomeOverride is provided", async () => {
+    // Intentional legacy model fixture: verifies an explicit user override is routed to workers unchanged.
     const codexHome = await mkdtemp(join(tmpdir(), "omx-codex-home-"));
     try {
       await writeFile(
@@ -1692,10 +1693,14 @@ describe("commandOwnsLocalHelp", () => {
       "explore",
       "hooks",
       "hud",
+      "notepad",
+      "project-memory",
       "ralph",
       "resume",
       "session",
       "sparkshell",
+      "trace",
+      "code-intel",
       "team",
       "tmux-hook",
     ]) {

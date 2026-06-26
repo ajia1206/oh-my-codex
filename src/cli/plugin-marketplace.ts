@@ -1,5 +1,5 @@
 import { existsSync } from "fs";
-import { cp, readdir, readFile, rm, writeFile } from "fs/promises";
+import { cp, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "fs/promises";
 import { join, resolve } from "path";
 import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../config/omx-first-party-mcp.js";
 import { teamModeEnabled, type SetupTeamMode } from "../config/team-mode.js";
@@ -309,6 +309,64 @@ async function writePinnedHookLauncher(
 	);
 }
 
+async function pathIsDirectory(path: string): Promise<boolean> {
+	try {
+		return (await lstat(path)).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+async function copyFileAtomically(sourcePath: string, destinationPath: string): Promise<void> {
+	const tempPath = `${destinationPath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	try {
+		await cp(sourcePath, tempPath, { force: true });
+		if (await pathIsDirectory(destinationPath)) {
+			await rm(destinationPath, { recursive: true, force: true });
+		}
+		await rename(tempPath, destinationPath);
+	} catch (error) {
+		await rm(tempPath, { recursive: true, force: true });
+		throw error;
+	}
+}
+
+interface OverlayDirectoryOptions {
+	onDestinationRootReady?: (destinationDir: string) => void | Promise<void>;
+}
+
+async function overlayDirectoryKeepingRootPresent(sourceDir: string, destinationDir: string, options: OverlayDirectoryOptions = {}): Promise<void> {
+	await mkdir(destinationDir, { recursive: true });
+	await options.onDestinationRootReady?.(destinationDir);
+	const sourceEntries = await readdir(sourceDir, { withFileTypes: true });
+	const sourceNames = new Set(sourceEntries.map((entry) => entry.name));
+
+	for (const entry of sourceEntries) {
+		const sourcePath = join(sourceDir, entry.name);
+		const destinationPath = join(destinationDir, entry.name);
+		if (entry.isDirectory()) {
+			if (existsSync(destinationPath) && !(await pathIsDirectory(destinationPath))) {
+				await rm(destinationPath, { recursive: true, force: true });
+			}
+			await overlayDirectoryKeepingRootPresent(sourcePath, destinationPath);
+		} else if (entry.isFile()) {
+			await copyFileAtomically(sourcePath, destinationPath);
+		}
+	}
+
+	let destinationEntries;
+	try {
+		destinationEntries = await readdir(destinationDir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	await Promise.all(
+		destinationEntries
+			.filter((entry) => !sourceNames.has(entry.name))
+			.map((entry) => rm(join(destinationDir, entry.name), { recursive: true, force: true })),
+	);
+}
+
 async function applyTeamModeToPluginCache(
 	cacheDir: string,
 	teamMode: SetupTeamMode | undefined,
@@ -328,7 +386,7 @@ export interface OmxPluginCacheMaterializeResult {
 export async function materializePackagedOmxPluginCache(
 	codexHomeDir: string,
 	packagedMarketplace: PackagedOmxMarketplace | null,
-	options: { dryRun?: boolean; teamMode?: SetupTeamMode } = {},
+	options: { dryRun?: boolean; teamMode?: SetupTeamMode; onCacheDirPrepared?: (cacheDir: string) => void | Promise<void> } = {},
 ): Promise<OmxPluginCacheMaterializeResult> {
 	if (!packagedMarketplace) return { status: "unavailable" };
 	const version = await packagedOmxPluginVersion(packagedMarketplace);
@@ -338,10 +396,20 @@ export async function materializePackagedOmxPluginCache(
 		return { status: "unchanged", cacheDir, version };
 	}
 	if (!options.dryRun) {
-		await rm(cacheDir, { recursive: true, force: true });
-		await cp(packagedMarketplace.pluginRoot, cacheDir, { recursive: true });
-		await applyTeamModeToPluginCache(cacheDir, options.teamMode);
-		await writePinnedHookLauncher(cacheDir, packagedMarketplace);
+		const cacheBase = omxPluginCacheBase(codexHomeDir);
+		await mkdir(cacheBase, { recursive: true });
+		const tempDir = join(cacheBase, `.materializing-${version}-${process.pid}-${Date.now()}`);
+		await rm(tempDir, { recursive: true, force: true });
+		await cp(packagedMarketplace.pluginRoot, tempDir, { recursive: true });
+		await applyTeamModeToPluginCache(tempDir, options.teamMode);
+		await writePinnedHookLauncher(tempDir, packagedMarketplace);
+		try {
+			await overlayDirectoryKeepingRootPresent(tempDir, cacheDir, {
+				onDestinationRootReady: options.onCacheDirPrepared,
+			});
+		} finally {
+			await rm(tempDir, { recursive: true, force: true });
+		}
 	}
 	return { status: "materialized", cacheDir, version };
 }
@@ -356,25 +424,28 @@ function isTomlTableHeader(line: string): boolean {
 	return /^\s*\[/.test(line);
 }
 
-export function stripLocalOmxMarketplaceRegistration(config: string): string {
+function stripTomlTablesByHeaderPattern(config: string, headerPattern: RegExp): string {
 	const lines = config.split(/\r?\n/);
-	const headerPattern = marketplaceTableHeaderPattern();
-	const start = lines.findIndex((line) => headerPattern.test(line));
-	if (start < 0) return config;
+	const result: string[] = [];
 
-	let end = lines.length;
-	for (let index = start + 1; index < lines.length; index += 1) {
-		if (isTomlTableHeader(lines[index])) {
-			end = index;
-			break;
+	for (let index = 0; index < lines.length; ) {
+		if (headerPattern.test(lines[index])) {
+			index += 1;
+			while (index < lines.length && !isTomlTableHeader(lines[index])) {
+				index += 1;
+			}
+			continue;
 		}
+
+		result.push(lines[index]);
+		index += 1;
 	}
 
-	const nextLines = [...lines.slice(0, start), ...lines.slice(end)];
-	return nextLines
-		.join("\n")
-		.replace(/\n{3,}/g, "\n\n")
-		.trimEnd();
+	return result.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+}
+
+export function stripLocalOmxMarketplaceRegistration(config: string): string {
+	return stripTomlTablesByHeaderPattern(config, marketplaceTableHeaderPattern());
 }
 
 export function buildLocalOmxMarketplaceRegistration(
@@ -416,22 +487,14 @@ export function hasLocalOmxPluginMcpServerRegistrations(config: string): boolean
 }
 
 export function stripLocalOmxPluginMcpServerRegistrations(config: string): string {
-	let lines = config.split(/\r?\n/);
+	let next = config;
 	for (const serverName of OMX_FIRST_PARTY_MCP_SERVER_NAMES) {
-		const headerPattern = localPluginMcpServerTableHeaderPattern(serverName);
-		const start = lines.findIndex((line) => headerPattern.test(line));
-		if (start < 0) continue;
-
-		let end = lines.length;
-		for (let index = start + 1; index < lines.length; index += 1) {
-			if (isTomlTableHeader(lines[index])) {
-				end = index;
-				break;
-			}
-		}
-		lines = [...lines.slice(0, start), ...lines.slice(end)];
+		next = stripTomlTablesByHeaderPattern(
+			next,
+			localPluginMcpServerTableHeaderPattern(serverName),
+		);
 	}
-	return lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+	return next;
 }
 
 function upsertTomlTableBooleanKey(
@@ -481,42 +544,11 @@ function upsertTomlTableBooleanKey(
 }
 
 export function upsertLocalOmxPluginEnablement(config: string): string {
-	const lines = config.split(/\r?\n/);
-	const headerPattern = localPluginTableHeaderPattern();
-	const start = lines.findIndex((line) => headerPattern.test(line));
-
-	if (start < 0) {
-		const base = config.trimEnd();
-		return `${base ? `${base}\n\n` : ""}[plugins.${JSON.stringify(OMX_LOCAL_PLUGIN_CONFIG_KEY)}]\nenabled = true\n`;
-	}
-
-	let end = lines.length;
-	for (let index = start + 1; index < lines.length; index += 1) {
-		if (isTomlTableHeader(lines[index])) {
-			end = index;
-			break;
-		}
-	}
-
-	let enabledIndex = -1;
-	for (let index = start + 1; index < end; index += 1) {
-		if (/^\s*enabled\s*=/.test(lines[index])) {
-			if (enabledIndex < 0) {
-				enabledIndex = index;
-				lines[index] = "enabled = true";
-			} else {
-				lines.splice(index, 1);
-				index -= 1;
-				end -= 1;
-			}
-		}
-	}
-
-	if (enabledIndex < 0) {
-		lines.splice(start + 1, 0, "enabled = true");
-	}
-
-	return lines.join("\n").replace(/\n*$/, "\n");
+	const stripped = stripTomlTablesByHeaderPattern(
+		config,
+		localPluginTableHeaderPattern(),
+	).trimEnd();
+	return `${stripped ? `${stripped}\n\n` : ""}[plugins.${JSON.stringify(OMX_LOCAL_PLUGIN_CONFIG_KEY)}]\nenabled = true\n`;
 }
 
 export function upsertLocalOmxPluginMcpServerEnablement(
@@ -531,7 +563,7 @@ export function upsertLocalOmxPluginMcpServerEnablement(
 	if (!enabled) {
 		return config;
 	}
-	let next = config;
+	let next = stripLocalOmxPluginMcpServerRegistrations(config);
 	for (const serverName of OMX_FIRST_PARTY_MCP_SERVER_NAMES) {
 		const header = `[plugins.${JSON.stringify(OMX_LOCAL_PLUGIN_CONFIG_KEY)}.mcp_servers.${serverName}]`;
 		const headerPattern = localPluginMcpServerTableHeaderPattern(serverName);

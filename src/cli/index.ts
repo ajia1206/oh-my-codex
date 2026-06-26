@@ -45,6 +45,7 @@ import { apiCommand } from "./api.js";
 import { agentsInitCommand } from "./agents-init.js";
 import { agentsCommand } from "./agents.js";
 import { sessionCommand } from "./session-search.js";
+import { urlCommand } from "./url.js";
 import { autoresearchCommand } from "./autoresearch.js";
 import { autoresearchGoalCommand } from "./autoresearch-goal.js";
 import { mcpParityCommand } from "./mcp-parity.js";
@@ -238,6 +239,7 @@ Usage:
   omx explore   DEPRECATED compatibility command; use normal repo inspection or omx sparkshell
   omx api       Run native omx-api localhost gateway commands (serve|status|stop|generate)
   omx session   Search prior local session transcripts (--codex-home <path> escape hatch)
+  omx url       Passive URL reader (read <url> --json)
   omx agents-init [path]
                 Bootstrap lightweight AGENTS.md files for a repo/subtree
   omx agents    Manage Codex native agent TOML files
@@ -400,6 +402,7 @@ type CliCommand =
   | "sparkshell"
   | "team"
   | "session"
+  | "url"
   | "resume"
   | "version"
   | "tmux-hook"
@@ -407,6 +410,10 @@ type CliCommand =
   | "hud"
   | "sidecar"
   | "state"
+  | "notepad"
+  | "project-memory"
+  | "trace"
+  | "code-intel"
   | "wiki"
   | "mcp-serve"
   | "status"
@@ -437,6 +444,10 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "hud",
   "sidecar",
   "state",
+  "notepad",
+  "project-memory",
+  "trace",
+  "code-intel",
   "wiki",
   "mcp-serve",
   "ralph",
@@ -444,6 +455,7 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "performance-goal",
   "resume",
   "session",
+  "url",
   "api",
   "sparkshell",
   "team",
@@ -2536,6 +2548,9 @@ export async function main(args: string[]): Promise<void> {
       case "session":
         await sessionCommand(args.slice(1));
         break;
+      case "url":
+        await urlCommand(args.slice(1));
+        break;
       case "ralph":
         await ralphCommand(args.slice(1));
         break;
@@ -2619,6 +2634,33 @@ export async function main(args: string[]): Promise<void> {
   }
 }
 
+type StaleCurrentAutopilotStatus = {
+  phase: string;
+};
+
+function sanitizedStatusString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+async function readStaleCurrentAutopilotStatus(cwd: string): Promise<StaleCurrentAutopilotStatus | null> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(join(getBaseStateDir(cwd), "current-autopilot.json"), "utf-8"));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const state = parsed as Record<string, unknown>;
+  if (state.active !== true) return null;
+  const phase = sanitizedStatusString(state.current_phase) ?? sanitizedStatusString(state.currentPhase);
+  const sessionId = sanitizedStatusString(state.session_id) ?? sanitizedStatusString(state.sessionId);
+  const tmuxPaneId = sanitizedStatusString(state.tmux_pane_id) ?? sanitizedStatusString(state.tmuxPaneId);
+  if (!phase && !sessionId && !tmuxPaneId) return null;
+  return { phase: phase ?? "active" };
+}
+
 async function showStatus(): Promise<void> {
   const { readFile } = await import("fs/promises");
   const cwd = process.cwd();
@@ -2640,15 +2682,24 @@ async function showStatus(): Promise<void> {
       }
       return false;
     };
-    if (!(await hasActiveWorkflowMode(refs))) {
+    let hasAuthoritativeActiveMode = await hasActiveWorkflowMode(refs);
+    if (!hasAuthoritativeActiveMode) {
       const runDirRefs = await listHookVisibleRunDirStateRefs(cwd);
-      if (await hasActiveWorkflowMode(runDirRefs)) refs = runDirRefs;
+      if (await hasActiveWorkflowMode(runDirRefs)) {
+        refs = runDirRefs;
+        hasAuthoritativeActiveMode = true;
+      }
     }
     const states = refs.map((ref) => ref.path);
     const ultragoalState = await readUltragoalState(cwd).catch(() => null);
     if (states.length === 0) {
       if (ultragoalState?.active) {
         console.log(`ultragoal: ACTIVE (phase: ${ultragoalState.status})`);
+        return;
+      }
+      const staleAutopilot = await readStaleCurrentAutopilotStatus(cwd);
+      if (staleAutopilot) {
+        console.log(`autopilot: STALE (phase: ${staleAutopilot.phase})`);
         return;
       }
       console.log("No active modes.");
@@ -2672,6 +2723,12 @@ async function showStatus(): Promise<void> {
     }
     if (ultragoalState?.active) {
       console.log(`ultragoal: ACTIVE (phase: ${ultragoalState.status})`);
+    }
+    if (!hasAuthoritativeActiveMode && !ultragoalState?.active) {
+      const staleAutopilot = await readStaleCurrentAutopilotStatus(cwd);
+      if (staleAutopilot) {
+        console.log(`autopilot: STALE (phase: ${staleAutopilot.phase})`);
+      }
     }
   } catch (err) {
     logCliOperationFailure(err);

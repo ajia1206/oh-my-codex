@@ -2,10 +2,10 @@
  * omx doctor - Validate oh-my-codex installation
  */
 
-import { existsSync, readFileSync } from "fs";
-import { mkdtemp, readdir, readFile, rm } from "fs/promises";
+import { constants, existsSync, readFileSync } from "fs";
+import { access, chown, lstat, mkdtemp, readdir, readFile, rm } from "fs/promises";
 import { spawnSync } from "child_process";
-import { basename, join } from "path";
+import { basename, join, relative } from "path";
 import { tmpdir } from "os";
 import {
 	codexHome,
@@ -37,6 +37,7 @@ import {
 	MANAGED_HOOK_EVENTS,
 	buildManagedCodexNativeHookCommand,
 	discoverCodexHookConfigPaths,
+	resolveWindowsPowerShellPath,
 	getManagedCodexHookCommandsForEvent,
 	getMissingManagedCodexHookEvents,
 	hasCodexHooksJsonTopLevelState,
@@ -96,6 +97,37 @@ interface Check {
 	status: "pass" | "warn" | "fail";
 	message: string;
 }
+
+interface RepoArtifactIssue {
+	path: string;
+	type: "ownership" | "writability";
+	reason: "root-owned" | "owner-mismatch" | "not-writable";
+	uid?: number;
+	gid?: number;
+}
+
+interface RepoArtifactStats {
+	uid?: number;
+	gid?: number;
+	isSymbolicLink(): boolean;
+	isDirectory(): boolean;
+}
+
+interface RepoArtifactScanOptions {
+	currentUid?: number;
+	currentGid?: number;
+	maxExamples?: number;
+	statPath?: (path: string) => Promise<RepoArtifactStats>;
+	readDir?: (path: string) => Promise<string[]>;
+	accessPath?: (path: string, mode: number) => Promise<void>;
+}
+
+interface RepoArtifactRepairOptions extends RepoArtifactScanOptions {
+	chownPath?: (path: string, uid: number, gid: number) => Promise<void>;
+}
+
+const REPO_ARTIFACT_DIRS = [".omx", ".beads"] as const;
+
 
 interface NativeHookDistSmokeOptions {
 	packageRoot?: string;
@@ -233,6 +265,27 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 			: scopeResolution.source === "config"
 				? " (inferred from Codex plugin config)"
 			: "";
+	if (options.force) {
+		if (options.dryRun) {
+			const check = await checkRepoArtifactOwnership(cwd);
+			if (check.status !== "pass") {
+				console.log(`Dry run: ${check.message}`);
+				console.log();
+			}
+		} else {
+			const repair = await repairRepoArtifactOwnership(cwd);
+			if (repair.repaired > 0 || repair.skipped.length > 0) {
+				console.log(
+					`Repo artifact ownership repair: ${repair.repaired} path(s) repaired${
+						repair.skipped.length > 0
+							? `, ${repair.skipped.length} skipped (${repair.skipped.join("; ")})`
+							: ""
+					}`,
+				);
+				console.log();
+			}
+		}
+	}
 
 	console.log("oh-my-codex doctor");
 	console.log("==================\n");
@@ -260,7 +313,12 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	checks.push(checkNodeVersion());
 
 	// Check 2.5: Explore harness readiness
-	checks.push(checkExploreHarness());
+	const exploreRoutingState = await resolveExploreRoutingState(paths.configPath);
+	checks.push(
+		checkExploreHarness(process.platform, process.env, {
+			exploreRoutingEnabled: exploreRoutingState.enabled,
+		}),
+	);
 
 	// Check 3: Codex home directory
 	checks.push(checkDirectory("Codex home", paths.codexHomeDir));
@@ -294,10 +352,14 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	if (runtimeMirrorCheck) checks.push(runtimeMirrorCheck);
 
 	// Check 4.5: Explore routing default
-	checks.push(await checkExploreRouting(paths.configPath));
+	checks.push(checkExploreRoutingFromState(exploreRoutingState));
 
 	// Check 4.6: Lore commit guard default
 	checks.push(await checkLoreCommitGuard(paths.configPath));
+
+	// Check 4.7: External process guards
+	const externalProcessGuardCheck = await checkExternalCodexProcessGuards();
+	if (externalProcessGuardCheck) checks.push(externalProcessGuardCheck);
 
 	// Check 5: Prompts installed
 	checks.push(
@@ -306,6 +368,9 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 
 	// Check 6: Skills installed
 	checks.push(await checkSkills(paths, scopeResolution.installMode));
+	if (scopeResolution.installMode === "plugin") {
+		checks.push(await checkPluginVersionDiagnostics(paths.codexHomeDir));
+	}
 
 	// Check 6.25: Native reviewer roles required by RALPLAN/Autopilot
 	const nativeReviewerRolesCheck = checkNativeReviewerRoles(
@@ -333,6 +398,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 
 	// Check 8: State directory
 	checks.push(checkDirectory("State dir", paths.stateDir));
+	checks.push(await checkRepoArtifactOwnership(cwd));
 
 	// Check 9: MCP servers configured
 	checks.push(
@@ -771,7 +837,19 @@ function checkNodeVersion(): Check {
 export function checkExploreHarness(
 	platform: NodeJS.Platform = process.platform,
 	env: NodeJS.ProcessEnv = process.env,
+	options: { exploreRoutingEnabled?: boolean } = {},
 ): Check {
+	const override = env[EXPLORE_BIN_ENV]?.trim();
+	const exploreRoutingEnabled = options.exploreRoutingEnabled ?? isExploreCommandRoutingEnabled(env);
+	if (!override && !exploreRoutingEnabled) {
+		return {
+			name: "Explore Harness",
+			status: "pass",
+			message:
+				"skipped: omx explore is hard-deprecated and explore routing is disabled by default; use omx sparkshell for shell-native read-only evidence",
+		};
+	}
+
 	const packageRoot = getPackageRoot();
 	const manifestPath = join(packageRoot, "crates", "omx-explore", "Cargo.toml");
 	if (!existsSync(manifestPath)) {
@@ -783,7 +861,6 @@ export function checkExploreHarness(
 		};
 	}
 
-	const override = env[EXPLORE_BIN_ENV]?.trim();
 	if (override) {
 		const resolved = join(packageRoot, override);
 		if (existsSync(override) || existsSync(resolved)) {
@@ -862,6 +939,178 @@ function checkDirectory(name: string, path: string): Check {
 		return { name, status: "pass", message: path };
 	}
 	return { name, status: "warn", message: `${path} (not created yet)` };
+}
+
+function currentProcessUid(): number | undefined {
+	return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+function currentProcessGid(): number | undefined {
+	return typeof process.getgid === "function" ? process.getgid() : undefined;
+}
+
+function remediationCommand(repoRoot: string): string {
+	return `sudo chown -R $(id -u):$(id -g) ${JSON.stringify(repoRoot)}`;
+}
+
+function formatArtifactPath(repoRoot: string, path: string): string {
+	const rel = relative(repoRoot, path);
+	return rel === "" ? "." : rel;
+}
+
+function formatArtifactIssue(repoRoot: string, issue: RepoArtifactIssue): string {
+	const owner =
+		typeof issue.uid === "number" && typeof issue.gid === "number"
+			? ` uid=${issue.uid} gid=${issue.gid}`
+			: "";
+	return `${formatArtifactPath(repoRoot, issue.path)} (${issue.reason}${owner})`;
+}
+
+function shouldReportOwnerMismatch(
+	uid: number | undefined,
+	currentUid: number | undefined,
+): boolean {
+	if (typeof uid !== "number") return false;
+	if (uid === 0) return true;
+	return typeof currentUid === "number" && uid !== currentUid;
+}
+
+function isOwnershipIssue(issue: RepoArtifactIssue): boolean {
+	return issue.type === "ownership";
+}
+
+async function collectRepoArtifactOwnershipIssues(
+	repoRoot: string,
+	options: RepoArtifactScanOptions = {},
+): Promise<RepoArtifactIssue[]> {
+	if (process.platform === "win32") return [];
+	const currentUid = options.currentUid ?? currentProcessUid();
+	const maxExamples = options.maxExamples ?? 20;
+	const statPath = options.statPath ?? lstat;
+	const readDir = options.readDir ?? readdir;
+	const accessPath = options.accessPath ?? access;
+	const issues: RepoArtifactIssue[] = [];
+	const visited = new Set<string>();
+
+	async function visit(path: string): Promise<void> {
+		if (issues.length >= maxExamples) return;
+		let info: RepoArtifactStats;
+		try {
+			info = await statPath(path);
+		} catch {
+			return;
+		}
+		if (info.isSymbolicLink()) return;
+
+		const uid = typeof info.uid === "number" ? info.uid : undefined;
+		const gid = typeof info.gid === "number" ? info.gid : undefined;
+		let reason: RepoArtifactIssue["reason"] | null = null;
+		if (uid === 0) reason = "root-owned";
+		else if (shouldReportOwnerMismatch(uid, currentUid)) reason = "owner-mismatch";
+		else {
+			try {
+				await accessPath(path, constants.W_OK);
+			} catch {
+				reason = "not-writable";
+			}
+		}
+		if (reason) {
+			issues.push({
+				path,
+				reason,
+				type: reason === "not-writable" ? "writability" : "ownership",
+				uid,
+				gid,
+			});
+		}
+		if (issues.length >= maxExamples || !info.isDirectory()) return;
+		if (visited.has(path)) return;
+		visited.add(path);
+
+		let entries: string[];
+		try {
+			entries = await readDir(path);
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			await visit(join(path, entry));
+			if (issues.length >= maxExamples) return;
+		}
+	}
+
+	for (const dir of REPO_ARTIFACT_DIRS) {
+		const root = join(repoRoot, dir);
+		if (existsSync(root)) await visit(root);
+	}
+	return issues;
+}
+
+export async function checkRepoArtifactOwnership(
+	repoRoot: string,
+	options: RepoArtifactScanOptions = {},
+): Promise<Check> {
+	const issues = await collectRepoArtifactOwnershipIssues(repoRoot, options);
+	if (issues.length === 0) {
+		return {
+			name: "Repo artifact ownership",
+			status: "pass",
+			message: "repo-local .omx/.beads artifacts are writable by the current user",
+		};
+	}
+
+	const examples = issues
+		.slice(0, options.maxExamples ?? 5)
+		.map((issue) => formatArtifactIssue(repoRoot, issue))
+		.join("; ");
+	const repair = remediationCommand(repoRoot);
+	return {
+		name: "Repo artifact ownership",
+		status: "warn",
+		message: `${issues.length} root-owned, owner-mismatched, or non-writable repo artifact(s): ${examples}. Safe remediation: ${repair}. Automatic repair is only run by \"omx doctor --force\" when the repo root is owned by the current user.`,
+	};
+}
+
+export async function repairRepoArtifactOwnership(
+	repoRoot: string,
+	options: RepoArtifactRepairOptions = {},
+): Promise<{ repaired: number; skipped: string[] }> {
+	if (process.platform === "win32") return { repaired: 0, skipped: [] };
+	const currentUid = options.currentUid ?? currentProcessUid();
+	const currentGid = options.currentGid ?? currentProcessGid();
+	if (typeof currentUid !== "number" || typeof currentGid !== "number") {
+		return { repaired: 0, skipped: ["current uid/gid unavailable"] };
+	}
+	const statPath = options.statPath ?? lstat;
+	const repoInfo = await statPath(repoRoot);
+	if (repoInfo.uid !== currentUid) {
+		return { repaired: 0, skipped: ["repo root is not owned by the current user"] };
+	}
+	const issues = await collectRepoArtifactOwnershipIssues(repoRoot, {
+		...options,
+		currentUid,
+		currentGid,
+		maxExamples: Number.MAX_SAFE_INTEGER,
+		statPath,
+	});
+	const ownershipIssues = issues.filter(isOwnershipIssue);
+	const writabilityIssues = issues.filter((issue) => !isOwnershipIssue(issue));
+	const chownPath = options.chownPath ?? chown;
+	let repaired = 0;
+	const skipped: string[] = [];
+	for (const issue of writabilityIssues) {
+		skipped.push(`${formatArtifactPath(repoRoot, issue.path)}: not writable by current user`);
+	}
+	for (const issue of ownershipIssues) {
+		try {
+			await chownPath(issue.path, currentUid, currentGid);
+			repaired++;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			skipped.push(`${formatArtifactPath(repoRoot, issue.path)}: ${message}`);
+		}
+	}
+	return { repaired, skipped };
 }
 
 function validateToml(content: string): string | null {
@@ -992,10 +1241,53 @@ async function checkModelContextRecommendation(
 	}
 }
 
-async function checkExploreRouting(configPath: string): Promise<Check> {
-	const envValue = process.env[OMX_EXPLORE_CMD_ENV];
+type ExploreRoutingState =
+	| { source: "env"; enabled: boolean }
+	| { source: "config"; enabled: boolean }
+	| { source: "default"; enabled: false; reason: "missing-config" | "unset" }
+	| { source: "unreadable"; enabled: false };
+
+async function resolveExploreRoutingState(
+	configPath: string,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<ExploreRoutingState> {
+	const envValue = env[OMX_EXPLORE_CMD_ENV];
 	if (typeof envValue === "string") {
-		if (isExploreCommandRoutingEnabled(process.env)) {
+		return { source: "env", enabled: isExploreCommandRoutingEnabled(env) };
+	}
+
+	if (!existsSync(configPath)) {
+		return { source: "default", enabled: false, reason: "missing-config" };
+	}
+
+	try {
+		const content = await readFile(configPath, "utf-8");
+		const parsed = parseToml(content) as {
+			env?: Record<string, unknown>;
+			shell_environment_policy?: { set?: Record<string, unknown> };
+		};
+		const configuredValue =
+			parsed?.shell_environment_policy?.set?.USE_OMX_EXPLORE_CMD ??
+			parsed?.env?.USE_OMX_EXPLORE_CMD;
+
+		if (typeof configuredValue === "string") {
+			return {
+				source: "config",
+				enabled: isExploreCommandRoutingEnabled({
+					USE_OMX_EXPLORE_CMD: configuredValue,
+				}),
+			};
+		}
+
+		return { source: "default", enabled: false, reason: "unset" };
+	} catch {
+		return { source: "unreadable", enabled: false };
+	}
+}
+
+function checkExploreRoutingFromState(state: ExploreRoutingState): Check {
+	if (state.source === "env") {
+		if (state.enabled) {
 			return {
 				name: "Explore routing",
 				status: "warn",
@@ -1011,54 +1303,39 @@ async function checkExploreRouting(configPath: string): Promise<Check> {
 		};
 	}
 
-	if (!existsSync(configPath)) {
+	if (state.source === "config") {
+		if (state.enabled) {
+			return {
+				name: "Explore routing",
+				status: "warn",
+				message:
+					'deprecated compatibility routing enabled in config.toml; set USE_OMX_EXPLORE_CMD = "0" under [shell_environment_policy.set] and use normal Codex repo inspection or omx sparkshell instead',
+			};
+		}
 		return {
 			name: "Explore routing",
 			status: "pass",
-			message: "deprecated by default (config.toml not found yet)",
+			message:
+				"deprecated compatibility routing disabled in config.toml (recommended)",
 		};
 	}
 
-	try {
-		const content = await readFile(configPath, "utf-8");
-		const parsed = parseToml(content) as {
-			env?: Record<string, unknown>;
-			shell_environment_policy?: { set?: Record<string, unknown> };
-		};
-		const configuredValue =
-			parsed?.shell_environment_policy?.set?.USE_OMX_EXPLORE_CMD ??
-			parsed?.env?.USE_OMX_EXPLORE_CMD;
-
-		if (typeof configuredValue === "string") {
-			if (isExploreCommandRoutingEnabled({
-				USE_OMX_EXPLORE_CMD: configuredValue,
-			})) {
-				return {
-					name: "Explore routing",
-					status: "warn",
-					message:
-						'deprecated compatibility routing enabled in config.toml; set USE_OMX_EXPLORE_CMD = "0" under [shell_environment_policy.set] and use normal Codex repo inspection or omx sparkshell instead',
-				};
-			}
-			return {
-				name: "Explore routing",
-				status: "pass",
-				message: "deprecated compatibility routing disabled in config.toml (recommended)",
-			};
-		}
-
-		return {
-			name: "Explore routing",
-			status: "pass",
-			message: "deprecated by default",
-		};
-	} catch {
+	if (state.source === "unreadable") {
 		return {
 			name: "Explore routing",
 			status: "fail",
 			message: "cannot read config.toml for explore routing check",
 		};
 	}
+
+	return {
+		name: "Explore routing",
+		status: "pass",
+		message:
+			state.reason === "missing-config"
+				? "deprecated by default (config.toml not found yet)"
+				: "deprecated by default",
+	};
 }
 
 const LORE_COMMIT_GUARD_EXPLICIT_OPT_OUT_VALUES = new Set([
@@ -1155,6 +1432,140 @@ function isExplicitLoreCommitGuardOptOut(value: string): boolean {
 	return LORE_COMMIT_GUARD_EXPLICIT_OPT_OUT_VALUES.has(
 		value.trim().toLowerCase(),
 	);
+}
+
+interface ExternalCodexProcessGuardOptions {
+	platform?: NodeJS.Platform;
+	homeDir?: string;
+}
+
+function decodeBasicXmlEntities(value: string): string {
+	return value
+		.replaceAll("&amp;", "&")
+		.replaceAll("&lt;", "<")
+		.replaceAll("&gt;", ">")
+		.replaceAll("&quot;", '"')
+		.replaceAll("&apos;", "'");
+}
+
+function extractPlistStrings(content: string): string[] {
+	return [...content.matchAll(/<string>([^<]+)<\/string>/g)].map((match) =>
+		decodeBasicXmlEntities(match[1]?.trim() ?? ""),
+	);
+}
+
+function extractPlistLabel(content: string, fallback: string): string {
+	const labelMatch = content.match(
+		/<key>Label<\/key>\s*<string>([^<]+)<\/string>/,
+	);
+	return decodeBasicXmlEntities(labelMatch?.[1]?.trim() || fallback);
+}
+
+async function readExistingTextFile(path: string): Promise<string> {
+	try {
+		return await readFile(path, "utf-8");
+	} catch {
+		return "";
+	}
+}
+
+function expandLaunchAgentPath(value: string, homeDir: string): string {
+	if (value === "~") return homeDir;
+	if (value.startsWith("~/")) return join(homeDir, value.slice(2));
+	if (value === "$HOME") return homeDir;
+	if (value.startsWith("$HOME/")) return join(homeDir, value.slice(6));
+	if (value === "${HOME}") return homeDir;
+	if (value.startsWith("${HOME}/")) return join(homeDir, value.slice(8));
+	return value;
+}
+
+function classifyExternalCodexProcessGuard(
+	plistContent: string,
+	combinedContent: string,
+): string | null {
+	const lowerPlist = plistContent.toLowerCase();
+	const lower = combinedContent.toLowerCase();
+	if (
+		lower.includes("codex-mcp-child-guard") ||
+		lower.includes("codex_mcp_child_guard") ||
+		combinedContent.includes("CODEX_MCP_GUARD_DEDUPE_APP_CHILDREN") ||
+		(lower.includes("codex app-server") &&
+			lower.includes("pgrep -p") &&
+			lower.includes("kill"))
+	) {
+		return "Codex app-server MCP child dedupe";
+	}
+	if (
+		(lowerPlist.includes("codex-xcode-mcp-guard") ||
+			lowerPlist.includes("codex_xcode_mcp_guard")) &&
+		lower.includes("xcodebuildmcp") &&
+		lower.includes("kill")
+	) {
+		return "XcodeBuildMCP cleanup";
+	}
+	return null;
+}
+
+export async function checkExternalCodexProcessGuards(
+	options: ExternalCodexProcessGuardOptions = {},
+): Promise<Check | null> {
+	const platform = options.platform ?? process.platform;
+	if (platform !== "darwin") return null;
+
+	const homeDir = options.homeDir ?? process.env.HOME;
+	if (!homeDir) return null;
+
+	const launchAgentsDir = join(homeDir, "Library", "LaunchAgents");
+	if (!existsSync(launchAgentsDir)) return null;
+
+	let entries: string[];
+	try {
+		entries = await readdir(launchAgentsDir);
+	} catch {
+		return null;
+	}
+
+	const findings: string[] = [];
+	for (const entry of entries) {
+		if (!entry.endsWith(".plist")) continue;
+		const plistPath = join(launchAgentsDir, entry);
+		const plistContent = await readExistingTextFile(plistPath);
+		if (plistContent.trim() === "") continue;
+
+		const loweredPlist = plistContent.toLowerCase();
+		if (
+			!loweredPlist.includes("codex") &&
+			!loweredPlist.includes("mcp") &&
+			!loweredPlist.includes("omx")
+		) {
+			continue;
+		}
+
+		let combinedContent = plistContent;
+		for (const value of extractPlistStrings(plistContent)) {
+			const expandedValue = expandLaunchAgentPath(value, homeDir);
+			if (!expandedValue.startsWith("/")) continue;
+			if (!existsSync(expandedValue)) continue;
+			combinedContent += `\n${await readExistingTextFile(expandedValue)}`;
+		}
+
+		const reason = classifyExternalCodexProcessGuard(
+			plistContent,
+			combinedContent,
+		);
+		if (!reason) continue;
+
+		const label = extractPlistLabel(plistContent, entry);
+		findings.push(`${label} (${reason})`);
+	}
+
+	if (findings.length === 0) return null;
+
+	return {
+		name: "External process guards",
+		status: "warn",
+		message: `external LaunchAgent(s) may terminate Codex/MCP helper processes outside OMX setup ownership: ${findings.join(", ")}; unload/remove them before attributing SIGTERM or transport resets to standard OMX MCP configuration`,
+	};
 }
 
 interface NativeHookCheckContext {
@@ -1546,6 +1957,42 @@ export function classifyPostCompactHookStdout(stdout: string): Check | null {
 	}
 }
 
+
+interface PostCompactSmokeSpawnInvocation {
+	command: string;
+	args: string[];
+	shell: boolean;
+}
+
+export function buildPostCompactSmokeSpawnInvocation(
+	expectedCommand: string,
+	options: {
+		platform?: NodeJS.Platform;
+		env?: NodeJS.ProcessEnv;
+	} = {},
+): PostCompactSmokeSpawnInvocation {
+	const platform = options.platform ?? process.platform;
+	if (platform === "win32") {
+		return {
+			command: resolveWindowsPowerShellPath(options.env),
+			args: [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-Command",
+				expectedCommand,
+			],
+			shell: false,
+		};
+	}
+
+	return {
+		command: expectedCommand,
+		args: [],
+		shell: true,
+	};
+}
+
 async function checkNativePostCompactHookRuntime(
 	hooksPath: string,
 	cwd: string,
@@ -1588,7 +2035,8 @@ async function checkNativePostCompactHookRuntime(
 			cwd: smokeCwd,
 			session_id: "omx-doctor-postcompact-smoke",
 		});
-		const result = spawnSync(expectedCommand, {
+		const smokeInvocation = buildPostCompactSmokeSpawnInvocation(expectedCommand);
+		const result = spawnSync(smokeInvocation.command, smokeInvocation.args, {
 			cwd,
 			encoding: "utf-8",
 			env: {
@@ -1596,7 +2044,7 @@ async function checkNativePostCompactHookRuntime(
 				OMX_NATIVE_HOOK_DOCTOR_SMOKE: "1",
 			},
 			input: payload,
-			shell: true,
+			shell: smokeInvocation.shell,
 			timeout: 5_000,
 		});
 
@@ -1869,6 +2317,94 @@ async function checkPluginMarketplaceRegistration(
 				"cannot read or parse config.toml for plugin marketplace registration",
 		};
 	}
+}
+
+async function readDoctorInstallStamp(codexHomeDir: string): Promise<{
+	install_channel?: string;
+	dev_base_version?: string;
+	install_revision?: string;
+} | null> {
+	try {
+		const parsed = JSON.parse(
+			await readFile(join(codexHomeDir, ".omx", "install-state.json"), "utf-8"),
+		) as {
+			install_channel?: unknown;
+			dev_base_version?: unknown;
+			install_revision?: unknown;
+		};
+		return {
+			...(typeof parsed.install_channel === "string" ? { install_channel: parsed.install_channel } : {}),
+			...(typeof parsed.dev_base_version === "string" ? { dev_base_version: parsed.dev_base_version } : {}),
+			...(typeof parsed.install_revision === "string" ? { install_revision: parsed.install_revision } : {}),
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function checkPluginVersionDiagnostics(
+	codexHomeDir: string,
+): Promise<Check> {
+	const packagedMarketplace = await resolvePackagedOmxMarketplace(getPackageRoot());
+	if (!packagedMarketplace) {
+		return {
+			name: "Plugin versions",
+			status: "warn",
+			message: `packaged ${OMX_LOCAL_MARKETPLACE_NAME} metadata was not found; reinstall oh-my-codex`,
+		};
+	}
+
+	const [manifestVersion, stamp] = await Promise.all([
+		packagedOmxPluginVersion(packagedMarketplace),
+		readDoctorInstallStamp(codexHomeDir),
+	]);
+	if (!manifestVersion) {
+		return {
+			name: "Plugin versions",
+			status: "warn",
+			message: "packaged plugin manifest has no version; reinstall oh-my-codex",
+		};
+	}
+
+	const cacheDir = join(
+		codexHomeDir,
+		"plugins",
+		"cache",
+		OMX_LOCAL_MARKETPLACE_NAME,
+		"oh-my-codex",
+		manifestVersion,
+	);
+	const cacheState = await readOmxPluginCacheState(cacheDir);
+	if (cacheState?.manifestVersion !== manifestVersion) {
+		return {
+			name: "Plugin versions",
+			status: "warn",
+			message: `expected cache directory ${cacheDir} is not materialized with packaged plugin manifest version ${manifestVersion}; run "omx setup --plugin --force" to refresh the plugin cache`,
+		};
+	}
+
+	if (stamp?.install_channel === "dev") {
+		const devDisplay = stamp.dev_base_version && stamp.install_revision
+			? `v${stamp.dev_base_version}-dev-${stamp.install_revision}`
+			: null;
+		const stampDetail = [
+			`package/plugin manifest version ${manifestVersion}`,
+			devDisplay ? `dev display version ${devDisplay}` : null,
+			stamp.dev_base_version ? `dev_base_version ${stamp.dev_base_version}` : null,
+			stamp.install_revision ? `install_revision ${stamp.install_revision}` : null,
+		].filter(Boolean).join("; ");
+		return {
+			name: "Plugin versions",
+			status: "pass",
+			message: `${stampDetail}; Codex may keep current-session plugin skill metadata until a new Codex session starts`,
+		};
+	}
+
+	return {
+		name: "Plugin versions",
+		status: "pass",
+		message: `cache directory version matches packaged plugin manifest version ${manifestVersion}`,
+	};
 }
 
 const REQUIRED_NATIVE_REVIEWER_ROLES = ["architect", "critic"] as const;
