@@ -20,6 +20,11 @@ export interface UltragoalActiveGoalForHud {
 
 export interface UltragoalStateForHud {
   active: boolean;
+  current_phase?: string;
+  mode?: string;
+  started_at?: string;
+  updated_at?: string;
+  session_id?: string;
   status?: string;
   total: number;
   complete: number;
@@ -72,7 +77,7 @@ export interface AutoresearchStateForHud {
   current_phase?: string;
 }
 
-export type LateGateHudSource = 'canonical-skill' | 'autopilot';
+export type LateGateHudSource = 'canonical-skill' | 'autopilot' | 'subagent-tracking';
 
 /** Code-review state for HUD display */
 export interface CodeReviewStateForHud {

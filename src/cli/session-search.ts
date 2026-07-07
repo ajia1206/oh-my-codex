@@ -1,15 +1,19 @@
+import { buildSessionFrictionReport, type SessionFrictionReport, type SessionFrictionOptions } from '../session-history/friction.js';
 import { parseSinceSpec, searchSessionHistory, type SessionSearchReport, type SessionSearchOptions } from '../session-history/search.js';
 import { refreshUnifiedLedger, searchUnifiedEntries, type UnifiedSessionEntry } from '../session-ledger/index.js';
 
-const HELP = `omx session - Search prior local session history
+const HELP = `omx session - Search and summarize local session history
 
 Usage:
   omx session list --unified [--json]
   omx session search <query> [options]
+  omx session friction [options]
 
-Options:
+Options for unified:
   --unified           Include CLI/API/App metadata in one local view
   --deep              Reserved for explicit deeper local reads; v1 does not persist full-text indexes
+
+Options for search:
   --limit <n>          Maximum results to return (default: 10)
   --session <id>       Restrict to a specific session id or id fragment
   --since <spec>       Restrict by recency (examples: 7d, 24h, 2026-03-10)
@@ -20,10 +24,20 @@ Options:
   --json               Emit structured JSON
   -h, --help           Show this help
 
+Options for friction:
+  --limit <n>          Maximum sessions to inspect (default: 5)
+  --session <id>       Restrict to a specific session id or id fragment
+  --since <spec>       Restrict by recency (default: 14d)
+  --project <scope>    Filter by project context: current | all | <cwd-fragment>
+  --codex-home <path>  Inspect only the supplied Codex home (escape hatch)
+  --json               Emit structured JSON
+
 Examples:
   omx session search "worker inbox path"
   omx session search all_workers_idle --since 7d --limit 5
   omx session search "team api" --project current --json
+  omx session friction --project current
+  omx session friction --session <id> --json
 `;
 
 const HELP_TOKENS = new Set(['--help', '-h', 'help']);
@@ -33,6 +47,11 @@ export interface ParsedSessionSearchArgs {
   json: boolean;
   unified: boolean;
   deep: boolean;
+}
+
+export interface ParsedSessionFrictionArgs {
+  options: SessionFrictionOptions;
+  json: boolean;
 }
 
 function parsePositiveInteger(value: string, flag: string): number {
@@ -48,6 +67,8 @@ export function parseSessionSearchArgs(args: string[]): ParsedSessionSearchArgs 
     query: '',
   };
   let json = false;
+  let unified = false;
+  let deep = false;
   const queryTokens: string[] = [];
 
   for (let index = 0; index < args.length; index += 1) {
@@ -57,9 +78,11 @@ export function parseSessionSearchArgs(args: string[]): ParsedSessionSearchArgs 
       continue;
     }
     if (token === '--unified') {
+      unified = true;
       continue;
     }
     if (token === '--deep') {
+      deep = true;
       continue;
     }
     if (token === '--case-sensitive') {
@@ -115,7 +138,7 @@ export function parseSessionSearchArgs(args: string[]): ParsedSessionSearchArgs 
     throw new Error(`Missing search query.\n${HELP}`);
   }
 
-  return { options, json, unified: args.includes('--unified'), deep: args.includes('--deep') };
+  return { options, json, unified, deep };
 }
 
 function parseUnifiedListArgs(args: string[]): { json: boolean; deep: boolean } {
@@ -124,6 +147,58 @@ function parseUnifiedListArgs(args: string[]): { json: boolean; deep: boolean } 
     if (!allowed.has(arg)) throw new Error(`Unknown option: ${arg}`);
   }
   return { json: args.includes('--json'), deep: args.includes('--deep') };
+}
+
+export function parseSessionFrictionArgs(args: string[]): ParsedSessionFrictionArgs {
+  const options: SessionFrictionOptions = {};
+  let json = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    if (token === '--limit' || token === '--session' || token === '--since' || token === '--project' || token === '--codex-home') {
+      const next = args[index + 1];
+      if (!next || next.startsWith('-')) {
+        throw new Error(`Missing value after ${token}.`);
+      }
+      if (token === '--limit') options.limit = parsePositiveInteger(next, token);
+      if (token === '--session') options.session = next;
+      if (token === '--since') options.since = next;
+      if (token === '--project') options.project = next;
+      if (token === '--codex-home') options.codexHomeDir = next;
+      index += 1;
+      continue;
+    }
+    if (token.startsWith('--limit=')) {
+      options.limit = parsePositiveInteger(token.slice('--limit='.length), '--limit');
+      continue;
+    }
+    if (token.startsWith('--session=')) {
+      options.session = token.slice('--session='.length);
+      continue;
+    }
+    if (token.startsWith('--since=')) {
+      options.since = token.slice('--since='.length);
+      continue;
+    }
+    if (token.startsWith('--project=')) {
+      options.project = token.slice('--project='.length);
+      continue;
+    }
+    if (token.startsWith('--codex-home=')) {
+      options.codexHomeDir = token.slice('--codex-home='.length);
+      continue;
+    }
+    if (token.startsWith('-')) {
+      throw new Error(`Unknown option: ${token}`);
+    }
+    throw new Error(`Unexpected positional argument for friction report: ${token}`);
+  }
+
+  return { options, json };
 }
 
 function formatUnifiedEntries(entries: UnifiedSessionEntry[]): string {
@@ -182,9 +257,43 @@ function formatReport(report: SessionSearchReport): string {
   return lines.join('\n');
 }
 
+function formatFrictionReport(report: SessionFrictionReport): string {
+  const lines = [
+    `Session friction report (${report.privacy.mode}; excludes ${report.privacy.excludes.join(', ')}).`,
+    `Scanned ${report.scanned_files} transcript(s) across ${report.sources.length} source(s).`,
+  ];
+
+  if (report.sessions.length === 0) {
+    lines.push('No recent local sessions matched the filters.');
+    return lines.join('\n');
+  }
+
+  for (const session of report.sessions) {
+    lines.push('');
+    lines.push(`session: ${session.session_id}`);
+    lines.push(`cwd: ${session.cwd_basename ?? 'unknown'} (${session.cwd_hash ? `hash:${session.cwd_hash}` : 'hash:unknown'})`);
+    lines.push(`activity: started=${session.started_at ?? 'unknown'} last=${session.last_activity_at ?? 'unknown'} idle=${session.idle_minutes ?? 'unknown'}m age=${session.age_minutes ?? 'unknown'}m`);
+    lines.push(`counts: records=${session.counters.records} user_turns=${session.counters.user_turns} assistant_turns=${session.counters.assistant_turns} tool_calls=${session.counters.tool_calls} tool_outputs=${session.counters.tool_outputs}`);
+    lines.push(`size: approx=${session.context_growth.approx_transcript_kb}KB avg_record=${session.context_growth.avg_record_bytes}B tool_ratio=${session.context_growth.tool_call_ratio}`);
+    lines.push(`idle_gaps: max=${session.idle_gaps.max_gap_minutes ?? 'none'}m over_30m=${session.idle_gaps.gaps_over_30m} over_2h=${session.idle_gaps.gaps_over_2h}`);
+    if (session.tool_names.length > 0) {
+      lines.push(`tools: ${session.tool_names.map((tool) => `${tool.name}(${tool.count})`).join(', ')}`);
+    }
+    lines.push(`risks: ${session.risks.map((risk) => `${risk.severity}:${risk.code}`).join(', ')}`);
+    lines.push(`source: ${session.source.codex_home}:ref:${session.source.transcript_ref}`);
+  }
+
+  return lines.join('\n');
+}
+
 export async function sessionCommand(args: string[]): Promise<void> {
   const subcommand = args[0];
   if (!subcommand || HELP_TOKENS.has(subcommand)) {
+    console.log(HELP.trim());
+    return;
+  }
+
+  if (args.slice(1).some((token) => HELP_TOKENS.has(token))) {
     console.log(HELP.trim());
     return;
   }
@@ -203,13 +312,19 @@ export async function sessionCommand(args: string[]): Promise<void> {
     return;
   }
 
-  if (subcommand !== 'search') {
-    throw new Error(`Unknown session subcommand: ${subcommand}\n${HELP}`);
+  if (subcommand === 'friction') {
+    const parsed = parseSessionFrictionArgs(args.slice(1));
+    const report = await buildSessionFrictionReport(parsed.options);
+    if (parsed.json) {
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
+    console.log(formatFrictionReport(report));
+    return;
   }
 
-  if (args.slice(1).some((token) => HELP_TOKENS.has(token))) {
-    console.log(HELP.trim());
-    return;
+  if (subcommand !== 'search') {
+    throw new Error(`Unknown session subcommand: ${subcommand}\n${HELP}`);
   }
 
   const parsed = parseSessionSearchArgs(args.slice(1));
@@ -231,6 +346,7 @@ export async function sessionCommand(args: string[]): Promise<void> {
     console.log(formatUnifiedEntries(entries));
     return;
   }
+
   const report = await searchSessionHistory(parsed.options);
   if (parsed.json) {
     console.log(JSON.stringify(report, null, 2));

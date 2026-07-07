@@ -1,66 +1,30 @@
-# oh-my-codex 0.18.14
+# oh-my-codex 0.19.0
 
-> Draft status: release-prep PR body source before tagging. Keep publication proof updates in `docs/qa/release-readiness-0.18.14.md` after PR CI, tag workflow, GitHub release creation, and npm publication.
+> Release status: candidate. Publication proof is recorded in `docs/qa/release-readiness-0.19.0.md`; this body is finalized after dev/main CI, tag workflow, GitHub release, native asset, and npm publication evidence are complete.
 
-`0.18.14` is a patch release after `0.18.13` focused on safer workflow orchestration, clearer agent/model routing diagnostics, sturdier plugin/HUD/team behavior, and release-candidate hygiene from the current `origin/dev` delta. It preserves the existing CLI/package contract while tightening setup, hook, HUD, Team, Ralplan, Autopilot, Ultragoal, and plugin-bundle edge cases discovered after `0.18.13`.
+`0.19.0` is a reliability and safety-hardening release after `0.18.17`. It preserves the existing CLI/package/plugin contract while locking down planning-gate and handoff-artifact execution transports, hardening the conductor contract and typed subagent/lane provenance, tightening Ralplan consensus/terminal-state handling, fixing madmax worktree and resume paths, and eliminating a long-standing parallel-test flake in the Rust suite.
 
 ## Highlights
 
-- **Agent/model routing is more transparent** — per-agent model overrides and model-routing launch diagnostics make selected roles, tiers, and launch arguments easier to inspect without changing the default operator contract.
-- **Planning and goal workflows are safer** — Ultragoal architecture invariants, completed Codex goal cleanup guidance, Ralplan freshness/approval checks, transition diagnostics, and supervised Autopilot review rework reduce stale or ambiguous workflow handoffs.
-- **Hooks and plugin packaging are sturdier** — native hook success handling, PreToolUse stdout/schema behavior, Windows hook command wrapping, dev plugin cache diagnostics, plugin AGENTS policy preservation, and bundled skill agent tier references are tightened.
-- **HUD and Team runtime behavior is cleaner** — stale Autopilot HUD reporting, cramped guard display, standalone pane-scoped HUD state, tmux paste-buffer cleanup, supervisor paste-buffer handling, worker AGENTS guidance preservation, and HUD pane ownership on shutdown are hardened.
-- **Doctor and resume discovery catch more local edge cases** — doctor detects root-owned repo artifacts, and resume search discovers madmax run histories.
+- Lock down planning-gate and handoff-artifact execution transports while still allowing legitimate deep-interview→ralplan artifact handoff.
+- Harden the conductor contract, typed subagent provenance, typed-lane fences, shell-guard target parsing, and conductor reuse ledger.
+- Tighten Ralplan consensus review evidence, terminal closeout state writes, and heredoc redirect scanning.
+- Fix Autopilot ralplan handoff, madmax worktree runtime roots, and madmax resume plugin cache preflight.
+- Render superseded Ultragoal goals correctly in the HUD.
+- Eliminate the intermittent Rust sparkshell test flake by making `unique_temp_dir()` collision-proof under parallel same-process execution.
 
-## Fixes / compatibility
+## Compatibility
 
-- Existing CLI, plugin, native-agent, HUD, state, hook, package layout, and runtime contracts remain compatible with `0.18.13`.
-- The release keeps npm/package layout compatibility and updates root/plugin/Cargo metadata to `0.18.14`.
-- Open PRs #2902, #2856, #2840, #2839, and #2838 are deliberately excluded from this candidate unless already present in `origin/dev`; release prep confirmed they remain open and `BEHIND` on `dev`.
-
-## Merged PR / commit inventory
-
-Primary merged PR and commit evidence in the current `origin/main..origin/dev` candidate includes:
-
-- #2912 — Bundle skill agent tier references.
-- #2906 — Fix HUD stale Autopilot reporting.
-- #2905 — Clarify goal and skill workflow guidance.
-- #2900 — Add model routing launch diagnostics.
-- #2899 — Preserve AGENTS guidance in Team worker worktrees.
-- #2897 — Detect root-owned repo artifacts in doctor.
-- #2896 — Fix HUD cramped guard and tmux buffer cleanup.
-- #2895 — Preserve PreToolUse planning guard output.
-- #2894 — Make completed Codex goal cleanup explicit.
-- #2889 — Harden dev plugin cache diagnostics.
-- #2888 — Fix PreToolUse native hook stdout schema.
-- #2884 — Fix Ralplan consensus gate approval and freshness checks.
-- #2879 — Fix Ralplan guard and HUD phase authority.
-- #2878 — Fix stale Autopilot stop state.
-- #2877 — Preserve plugin AGENTS policy blocks during setup.
-- #2875 — Allow Beads tracker metadata during planning.
-- #2874 — Keep native hooks successful on null output.
-- #2873 — Harden tmux supervisor paste buffers.
-- #2861 — Keep standalone pane-scoped HUD stable.
-- #2859 — Avoid shell-wrapping Windows native hook node.
-- #2852 — Discover madmax run histories for resume search.
-- #2850 — Add per-agent model overrides.
-- #2848 — Add Ultragoal architecture invariant gate.
-- #2828 — Preserve HUD pane ownership on shutdown.
-- Direct commits — explain Ralplan transition validator diagnostics and add supervised Autopilot review rework phase.
+No breaking CLI, package, plugin-layout, or configuration changes are intended.
 
 ## Validation
 
-Release readiness evidence is recorded in `docs/qa/release-readiness-0.18.14.md`.
+Release readiness evidence is recorded in `docs/qa/release-readiness-0.19.0.md`.
 
-Release-prep gates include version sync for `v0.18.14`, build, native-agent verification, plugin mirror/bundle checks, catalog docs check, dogfooding of built CLI surfaces, `npm pack --dry-run`, and `git diff --check`. Branch CI, dev/main promotion, tag-triggered release workflow, GitHub release proof, and npm publication proof remain publication-stage gates.
-
-The GitHub release workflow remains the authoritative cross-platform native asset gate after tag push, including the uploaded `native-release-manifest.json`.
+Release-prep gates include version sync for `v0.19.0`, build, native-agent verification, plugin mirror/bundle checks, catalog docs check, the full Rust and node test suites (Rust rerun repeatedly to prove the flake fix), `npm pack --dry-run`, and `git diff --check`. Branch CI, dev/main promotion, tag-triggered release workflow, GitHub release proof, and npm publication proof are appended to readiness evidence after publication.
 
 ## Contributors
 
-Thanks to the contributors who landed the `v0.18.13...v0.18.14` delta:
+Thanks to the contributors who made this release possible.
 
-- [@Bellman](https://github.com/Bellman)
-- [@jihun-jeong](https://github.com/jihun-jeong)
-
-**Full Changelog**: [`v0.18.13...v0.18.14`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.18.13...v0.18.14)
+**Full Changelog**: [`v0.18.17...v0.19.0`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.18.17...v0.19.0)

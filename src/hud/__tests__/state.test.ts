@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { basename, join, relative } from 'node:path';
 import { renderHud } from '../render.js';
 import { recordSkillActivation } from '../../hooks/keyword-detector.js';
+import { createSubagentTrackingState, recordSubagentTurn, writeSubagentTrackingState } from '../../subagents/tracker.js';
 import {
   buildGitBranchLabel,
   readGitBranch,
@@ -334,6 +335,102 @@ describe('readUltragoalState', { concurrency: false }, () => {
       assert.equal(state?.inProgress, 1);
       assert.equal(state?.pending, 1);
       assert.deepEqual(state?.ongoingGoals?.map((goal) => goal.id), ['G002-running', 'G003-pending']);
+    });
+  });
+
+  it('treats superseded pending ultragoal goals as terminal for HUD activity', async () => {
+    await withTempRepo('omx-hud-ultragoal-superseded-terminal-', async (cwd) => {
+      const ultragoalDir = join(cwd, '.omx', 'ultragoal');
+      await mkdir(ultragoalDir, { recursive: true });
+      await writeFile(join(ultragoalDir, 'goals.json'), JSON.stringify({
+        version: 1,
+        activeGoalId: 'G002-old-pending',
+        goals: [
+          { id: 'G001-done', title: 'Done', objective: 'Completed accepted replacement', status: 'complete' },
+          { id: 'G002-old-pending', title: 'Old pending', objective: 'Superseded work that should not remain active in HUD', status: 'pending', steeringStatus: 'superseded', supersededBy: ['G001-done'] },
+        ],
+      }));
+
+      const state = await readUltragoalState(cwd);
+
+      assert.equal(state?.active, false);
+      assert.equal(state?.status, 'complete');
+      assert.equal(state?.pending, 0);
+      assert.equal(state?.activeGoal, undefined);
+      assert.deepEqual(state?.ongoingGoals, []);
+      assert.deepEqual(state?.nextGoals, []);
+    });
+  });
+
+  it('keeps superseded ultragoal goals active until replacements are declared', async () => {
+    await withTempRepo('omx-hud-ultragoal-superseded-without-replacements-', async (cwd) => {
+      const ultragoalDir = join(cwd, '.omx', 'ultragoal');
+      await mkdir(ultragoalDir, { recursive: true });
+      await writeFile(join(ultragoalDir, 'goals.json'), JSON.stringify({
+        version: 1,
+        activeGoalId: 'G002-old-pending',
+        goals: [
+          { id: 'G001-done', title: 'Done', objective: 'Completed prior work', status: 'complete' },
+          { id: 'G002-old-pending', title: 'Old pending', objective: 'Superseded work without an auditable replacement', status: 'pending', steeringStatus: 'superseded' },
+        ],
+      }));
+
+      const state = await readUltragoalState(cwd);
+
+      assert.equal(state?.active, true);
+      assert.equal(state?.status, 'pending');
+      assert.equal(state?.pending, 1);
+      assert.equal(state?.activeGoal?.id, 'G002-old-pending');
+      assert.deepEqual(state?.ongoingGoals?.map((goal) => goal.id), ['G002-old-pending']);
+    });
+  });
+
+  it('keeps superseded ultragoal goals active until every replacement is resolved', async () => {
+    await withTempRepo('omx-hud-ultragoal-superseded-unresolved-replacement-', async (cwd) => {
+      const ultragoalDir = join(cwd, '.omx', 'ultragoal');
+      await mkdir(ultragoalDir, { recursive: true });
+      await writeFile(join(ultragoalDir, 'goals.json'), JSON.stringify({
+        version: 1,
+        activeGoalId: 'G002-old-pending',
+        goals: [
+          { id: 'G001-done', title: 'Done', objective: 'Completed prior work', status: 'complete' },
+          { id: 'G002-old-pending', title: 'Old pending', objective: 'Superseded work with unfinished replacements', status: 'pending', steeringStatus: 'superseded', supersededBy: ['G003-real-pending'] },
+          { id: 'G003-real-pending', title: 'Real pending', objective: 'Finish replacement work', status: 'pending', supersedes: ['G002-old-pending'] },
+        ],
+      }));
+
+      const state = await readUltragoalState(cwd);
+
+      assert.equal(state?.active, true);
+      assert.equal(state?.status, 'pending');
+      assert.equal(state?.pending, 2);
+      assert.equal(state?.activeGoal?.id, 'G002-old-pending');
+      assert.deepEqual(state?.ongoingGoals?.map((goal) => goal.id), ['G002-old-pending', 'G003-real-pending']);
+    });
+  });
+
+  it('falls through resolved superseded activeGoalId to genuinely active pending ultragoal goals', async () => {
+    await withTempRepo('omx-hud-ultragoal-superseded-with-active-pending-', async (cwd) => {
+      const ultragoalDir = join(cwd, '.omx', 'ultragoal');
+      await mkdir(ultragoalDir, { recursive: true });
+      await writeFile(join(ultragoalDir, 'goals.json'), JSON.stringify({
+        version: 1,
+        activeGoalId: 'G002-old-pending',
+        goals: [
+          { id: 'G001-done', title: 'Done', objective: 'Completed old work', status: 'complete' },
+          { id: 'G002-old-pending', title: 'Old pending', objective: 'Superseded work that should not remain active in HUD', status: 'pending', steeringStatus: 'superseded', supersededBy: ['G003-replacement-done'] },
+          { id: 'G003-replacement-done', title: 'Replacement done', objective: 'Completed replacement work', status: 'complete', supersedes: ['G002-old-pending'] },
+          { id: 'G004-real-pending', title: 'Real pending', objective: 'Still-active follow-up work', status: 'pending' },
+        ],
+      }));
+
+      const state = await readUltragoalState(cwd);
+
+      assert.equal(state?.active, true);
+      assert.equal(state?.status, 'pending');
+      assert.equal(state?.pending, 1);
+      assert.equal(state?.activeGoal?.id, 'G004-real-pending');
+      assert.deepEqual(state?.ongoingGoals?.map((goal) => goal.id), ['G004-real-pending']);
     });
   });
 
@@ -775,6 +872,35 @@ describe('readAllState canonical skill precedence', () => {
     });
   });
 
+  it('surfaces real keyword-activated ultragoal phase in state and HUD before goals exist', async () => {
+    await withTempRepo('omx-hud-keyword-ultragoal-', async (cwd) => {
+      const rootStateDir = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-ultragoal-keyword';
+      await mkdir(join(rootStateDir, 'sessions', sessionId), { recursive: true });
+      await writeFile(join(rootStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+
+      await recordSkillActivation({
+        stateDir: rootStateDir,
+        sourceCwd: cwd,
+        text: '$ultragoal create goals for HUD',
+        sessionId,
+        nowIso: '2026-06-01T00:00:00.000Z',
+      });
+
+      const state = await readAllState(cwd);
+      assert.deepEqual(state.ultragoal, {
+        active: true,
+        mode: 'ultragoal',
+        current_phase: 'planning',
+        started_at: '2026-06-01T00:00:00.000Z',
+        updated_at: '2026-06-01T00:00:00.000Z',
+        session_id: sessionId,
+      });
+      const rendered = stripSgr(renderHud(state, 'focused'));
+      assert.ok(rendered.includes('ultragoal:planning'));
+    });
+  });
+
   it('surfaces real keyword-activated code-review phase in state and HUD', async () => {
     await withTempRepo('omx-hud-keyword-code-review-', async (cwd) => {
       const rootStateDir = join(cwd, '.omx', 'state');
@@ -858,6 +984,135 @@ describe('readAllState canonical skill precedence', () => {
       assert.equal(state.codeReview, null);
       assert.equal(state.ultraqa, null);
       assert.deepEqual(state.autopilot, { active: true, mode: 'autopilot', current_phase: 'ralplan' });
+    });
+  });
+
+  it('surfaces live code-reviewer subagent evidence when canonical autopilot state is inactive', async () => {
+    await withTempRepo('omx-hud-inactive-autopilot-live-review-', async (cwd) => {
+      const rootStateDir = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-inactive-autopilot-review';
+      const sessionDir = join(rootStateDir, 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(rootStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: false,
+        skill: 'autopilot',
+        phase: 'reviewing',
+        session_id: sessionId,
+      }));
+      await writeFile(join(sessionDir, 'autopilot-state.json'), JSON.stringify({
+        active: false,
+        mode: 'autopilot',
+        current_phase: 'reviewing',
+        session_id: sessionId,
+      }));
+
+      let tracking = createSubagentTrackingState();
+      tracking = recordSubagentTurn(tracking, {
+        sessionId,
+        threadId: 'thread-leader',
+        kind: 'leader',
+        timestamp: '2026-06-25T00:00:00.000Z',
+      });
+      tracking = recordSubagentTurn(tracking, {
+        sessionId,
+        threadId: 'thread-code-reviewer',
+        kind: 'subagent',
+        leaderThreadId: 'thread-leader',
+        mode: 'code-reviewer',
+        timestamp: new Date().toISOString(),
+      });
+      await writeSubagentTrackingState(cwd, tracking);
+
+      const state = await readAllState(cwd);
+      assert.equal(state.autopilot, null);
+      assert.deepEqual(state.codeReview, { active: true, current_phase: 'reviewing', source: 'subagent-tracking' });
+      assert.equal(stripSgr(renderHud(state, 'focused')).includes('code-review:reviewing'), true);
+    });
+  });
+
+  it('does not surface live code-reviewer subagent evidence over active Autopilot planning', async () => {
+    await withTempRepo('omx-hud-active-autopilot-live-review-', async (cwd) => {
+      const rootStateDir = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-active-autopilot-review';
+      const sessionDir = join(rootStateDir, 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(rootStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: true,
+        skill: 'autopilot',
+        phase: 'planning',
+        session_id: sessionId,
+        active_skills: [{ skill: 'autopilot', phase: 'planning', active: true, session_id: sessionId }],
+      }));
+      await writeFile(join(sessionDir, 'autopilot-state.json'), JSON.stringify({
+        active: true,
+        mode: 'autopilot',
+        current_phase: 'planning',
+        session_id: sessionId,
+      }));
+
+      let tracking = createSubagentTrackingState();
+      tracking = recordSubagentTurn(tracking, {
+        sessionId,
+        threadId: 'thread-leader',
+        kind: 'leader',
+        timestamp: '2026-06-25T00:00:00.000Z',
+      });
+      tracking = recordSubagentTurn(tracking, {
+        sessionId,
+        threadId: 'thread-code-reviewer',
+        kind: 'subagent',
+        leaderThreadId: 'thread-leader',
+        mode: 'code-reviewer',
+        timestamp: new Date().toISOString(),
+      });
+      await writeSubagentTrackingState(cwd, tracking);
+
+      const state = await readAllState(cwd);
+      assert.deepEqual(state.autopilot, { active: true, mode: 'autopilot', current_phase: 'planning', session_id: sessionId });
+      assert.equal(state.codeReview, null);
+      const rendered = stripSgr(renderHud(state, 'focused'));
+      assert.equal(rendered.includes('autopilot:planning'), true);
+      assert.equal(rendered.includes('code-review:reviewing'), false);
+    });
+  });
+
+  it('does not surface completed code-reviewer subagent history over inactive canonical state', async () => {
+    await withTempRepo('omx-hud-inactive-autopilot-completed-review-', async (cwd) => {
+      const rootStateDir = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-inactive-autopilot-completed-review';
+      const sessionDir = join(rootStateDir, 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(rootStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: false,
+        skill: 'autopilot',
+        phase: 'reviewing',
+        session_id: sessionId,
+      }));
+
+      let tracking = createSubagentTrackingState();
+      tracking = recordSubagentTurn(tracking, {
+        sessionId,
+        threadId: 'thread-leader',
+        kind: 'leader',
+        timestamp: '2026-06-25T00:00:00.000Z',
+      });
+      tracking = recordSubagentTurn(tracking, {
+        sessionId,
+        threadId: 'thread-code-reviewer',
+        kind: 'subagent',
+        leaderThreadId: 'thread-leader',
+        mode: 'code-reviewer',
+        completed: true,
+        timestamp: new Date().toISOString(),
+      });
+      await writeSubagentTrackingState(cwd, tracking);
+
+      const state = await readAllState(cwd);
+      assert.equal(state.autopilot, null);
+      assert.equal(state.codeReview, null);
     });
   });
 

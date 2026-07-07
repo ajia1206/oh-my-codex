@@ -4,6 +4,87 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-04
+
+Reliability and safety-hardening train after `0.18.17`: planning-gate and handoff-artifact execution transports are locked down, the conductor contract and typed subagent/lane provenance are hardened, Ralplan consensus/terminal-state handling is tightened, madmax worktree and resume paths are fixed, and a long-standing parallel-test flake in the Rust suite is eliminated. The CLI/package/plugin contract is preserved.
+
+### Changed
+
+- **Planning and handoff execution transports are locked down** — `.omx/tmp` planning artifacts, same-command handoff artifact scripts, and planning-guard Python/read-only-Bash writes can no longer be used as execution transports, while legitimate deep-interview→ralplan artifact handoff is still allowed.
+- **Conductor and typed-lane contracts are hardened** — conductor contract, typed subagent provenance, typed-lane fences, shell-guard target parsing, and the conductor reuse ledger reduce unsafe or ambiguous delegation.
+
+### Fixed
+
+- **Test flakiness eliminated** — the Rust sparkshell test helper `unique_temp_dir()` now uses a per-process monotonic counter so parallel same-process tests can no longer collide on a shared temp state root, fixing intermittent `json_mode_reports_failed_worker_status` failures.
+- **Ralplan consensus and terminal state are safer** — consensus review evidence, terminal closeout state writes, and heredoc redirect scanning are hardened against stale or unsafe writes.
+- **Autopilot and madmax paths are sturdier** — Autopilot ralplan handoff, madmax worktree runtime roots, and madmax resume plugin cache preflight are corrected.
+- **HUD Ultragoal status is accurate** — superseded Ultragoal goals render correctly in the HUD.
+
+### PRs
+
+- #3056, #3055, #3054, #3051, #3050, #3048, #3047, #3046, #3045, #3042, #3040, #3038, #3037, #3035, #3032, #3031, #3030, #3025, #3022, #3018
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.19.0.md`.
+
+## [0.18.17] - 2026-07-01
+
+Patch release for the post-`0.18.16` runtime reliability train: Ultragoal null-goal recovery, MSYS/Windows Team startup handling, Ralplan terminal state, planning-gate write guards, and profile mention fallback behavior are tightened while preserving the existing CLI/package contract.
+
+### Changed
+
+- **Planning and conductor guardrails are stricter** — planning-gate state-write guards and exact-role worker routing reduce stale or unsafe planning writes in long-running workflows.
+- **Windows and MSYS workflow handling is sturdier** — psmux question rendering and Team worker startup paths are fixed for Windows/MSYS environments.
+
+### Fixed
+
+- **Ultragoal null-goal loops recover cleanly** — repeated `get_goal` null-result loops now have recovery behavior instead of leaving sessions stuck.
+- **Ralplan terminal session state is safer** — Ralplan terminal state handling avoids stale or mismatched continuation state.
+- **Stop keyword and profile mention edge cases are quieter** — path false positives and Discord mention fallback behavior are corrected.
+
+### PRs
+
+- #3020, #3017, #3015, #3014, #3012, #3011, #3009, #3008, #3006, #3004, #3003, #3000, #2999, #2998, #2997, #2996, #2991, #2990, #2989, #2987, #2986, #2985, #2982, #2981, #2979
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.17.md`.
+
+## [0.18.16] - 2026-06-27
+
+Patch release for the post-`0.18.15` diagnostics and stale-state hardening train: local session friction reporting is available, stale HUD/Ralph continuation state is guarded, and doctor artifact ownership warnings are safer.
+
+### Changed
+
+- **Local session friction reporting is available** — `omx session friction` can surface local run/session friction signals so resume and debugging workflows have more actionable history.
+
+### Fixed
+
+- **Stale HUD and Ralph continuation state is guarded** — HUD review status and Ralph Stop continuation handling avoid carrying stale review/stop signals across later workflow phases.
+- **Doctor artifact ownership diagnostics are safer** — `omx doctor` detects root-owned repository artifacts more clearly without over-warning on normal local files.
+
+### PRs
+
+- #2975, #2973, #2972, #2970
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.16.md`.
+
+## [0.18.15] - 2026-06-25
+
+Patch release for the post-`0.18.14` goal/runtime reliability train: completed-goal cleanup, state-path handling, guided autoresearch intake, MCP parity coverage, and native-hook resilience were tightened before the `0.18.16` follow-up train.
+
+### Fixed
+
+- **Goal and hook cleanup is sturdier** — completed-goal cleanup and native-hook handling are hardened for follow-up workflow runs.
+- **State path and autoresearch coverage is broader** — MCP state-path tests and guided autoresearch intake checks protect the release train.
+
+### Verification
+
+- `v0.18.15` was published from commit `e9e3bcc7` and superseded by the `0.18.16` release train.
+
 ## [0.18.14] - 2026-06-20
 
 Patch release for the post-`0.18.13` reliability train: agent/model routing diagnostics are clearer, goal/planning workflows are safer, plugin and native-hook behavior is sturdier, HUD/Team/tmux edge cases are tightened, doctor catches root-owned repo artifacts, and resume search discovers madmax run histories.

@@ -6,7 +6,7 @@
 import { execFileSync, spawn } from "child_process";
 import { basename, dirname, join, posix, resolve, win32 } from "path";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "fs";
-import { copyFile, cp, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } from "fs/promises";
+import { copyFile, cp, lstat, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "fs/promises";
 import { constants as osConstants, homedir } from "os";
 import { createHash } from "crypto";
 import {
@@ -84,6 +84,13 @@ import {
   resolveProjectLocalCodexHomeForLaunch,
 } from "./codex-home.js";
 import { discoverProjectRuntimeCodexHomes } from "./project-runtime-codex-homes.js";
+import {
+  materializePackagedOmxPluginCache,
+  packagedOmxPluginVersion,
+  resolvePackagedOmxMarketplace,
+  upsertLocalOmxMarketplaceRegistration,
+  upsertLocalOmxPluginEnablement,
+} from "./plugin-marketplace.js";
 import { escapeTomlString, readTopLevelTomlString, upsertTopLevelTomlString } from "../utils/toml.js";
 
 export {
@@ -170,8 +177,10 @@ import { buildHookEvent } from "../hooks/extensibility/events.js";
 import { dispatchHookEvent } from "../hooks/extensibility/dispatcher.js";
 import {
   collectInheritableTeamWorkerArgs as collectInheritableTeamWorkerArgsShared,
+  parseTeamWorkerLaunchArgs,
   resolveTeamWorkerLaunchArgs,
   resolveTeamLowComplexityDefaultModel,
+  TEAM_WORKER_INHERITED_MODEL_ENV,
 } from "../team/model-contract.js";
 import {
   parseWorktreeMode,
@@ -238,7 +247,7 @@ Usage:
                 Resume/open a unified CLI/API/App session entry in its original identity/source
   omx explore   DEPRECATED compatibility command; use normal repo inspection or omx sparkshell
   omx api       Run native omx-api localhost gateway commands (serve|status|stop|generate)
-  omx session   Search prior local session transcripts (--codex-home <path> escape hatch)
+  omx session   Search and summarize local session history (--codex-home <path> escape hatch)
   omx url       Passive URL reader (read <url> --json)
   omx agents-init [path]
                 Bootstrap lightweight AGENTS.md files for a repo/subtree
@@ -974,25 +983,40 @@ async function materializeProjectLaunchRuntimeHistoryEntries(
 async function mergeProjectLaunchRuntimeHistoryEntries(
   runtimeCodexHome: string,
   sourceCodexHome: string,
+  mergedHistorySourceRealpaths: Set<string>,
 ): Promise<void> {
   for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
     const source = join(sourceCodexHome, entryName);
     if (!existsSync(source)) continue;
+    const sourceRealpath = realpathSync(source);
+    if (mergedHistorySourceRealpaths.has(sourceRealpath)) continue;
     const destination = join(runtimeCodexHome, entryName);
-    const sourceStat = await lstat(source);
+    const sourceStat = await stat(source);
     if (sourceStat.isDirectory()) {
       await mkdir(destination, { recursive: true });
       await cp(source, destination, { recursive: true, force: true, dereference: true });
+      mergedHistorySourceRealpaths.add(sourceRealpath);
       continue;
     }
+    if (entryName === "sessions") continue;
+    if (!sourceStat.isFile()) continue;
     if (existsSync(destination)) {
+      const destinationStat = await stat(destination);
+      if (!destinationStat.isFile()) {
+        await rm(destination, { recursive: true, force: true });
+        await copyFile(source, destination);
+        mergedHistorySourceRealpaths.add(sourceRealpath);
+        continue;
+      }
       const existing = await readFile(destination, "utf-8").catch(() => "");
       const addition = await readFile(source, "utf-8");
       const separator = existing === "" || existing.endsWith("\n") || addition === "" ? "" : "\n";
       await writeFile(destination, `${existing}${separator}${addition}`, "utf-8");
+      mergedHistorySourceRealpaths.add(sourceRealpath);
       continue;
     }
     await copyFile(source, destination);
+    mergedHistorySourceRealpaths.add(sourceRealpath);
   }
 }
 
@@ -1058,9 +1082,14 @@ export async function prepareRuntimeCodexHomeForProjectLaunch(
   }
   await ensureProjectLaunchRuntimeHistoryLinks(runtimeCodexHome, projectCodexHome);
   if (options.includeHistoryArtifacts === true && (options.extraHistoryCodexHomes?.length ?? 0) > 0) {
+    const mergedHistorySourceRealpaths = new Set<string>();
+    for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
+      const source = join(projectCodexHome, entryName);
+      if (existsSync(source)) mergedHistorySourceRealpaths.add(realpathSync(source));
+    }
     await materializeProjectLaunchRuntimeHistoryEntries(runtimeCodexHome, projectCodexHome);
     for (const extraCodexHome of options.extraHistoryCodexHomes ?? []) {
-      await mergeProjectLaunchRuntimeHistoryEntries(runtimeCodexHome, extraCodexHome);
+      await mergeProjectLaunchRuntimeHistoryEntries(runtimeCodexHome, extraCodexHome, mergedHistorySourceRealpaths);
     }
   }
 
@@ -1153,6 +1182,57 @@ export function parseResumeCodexHomeSelection(args: string[]): ResumeCodexHomeSe
   };
 }
 
+export interface ResumePluginPreflightResult {
+  status: "unavailable" | "prepared";
+  version?: string;
+  cacheDir?: string;
+  prunedStaleDirs: string[];
+  configUpdated: boolean;
+}
+
+
+export async function preflightResumeOmxPluginState(
+  codexHomeDir: string | undefined,
+  pkgRoot = getPackageRoot(),
+): Promise<ResumePluginPreflightResult> {
+  const selectedCodexHomeDir = codexHomeDir && codexHomeDir.trim() !== ""
+    ? codexHomeDir
+    : join(homedir(), ".codex");
+  const packagedMarketplace = await resolvePackagedOmxMarketplace(pkgRoot);
+  if (!packagedMarketplace) {
+    return { status: "unavailable", prunedStaleDirs: [], configUpdated: false };
+  }
+
+  const materialized = await materializePackagedOmxPluginCache(selectedCodexHomeDir, packagedMarketplace);
+  const version = materialized.version ?? (await packagedOmxPluginVersion(packagedMarketplace)) ?? undefined;
+  const currentCacheDir = materialized.cacheDir ?? (version ? join(selectedCodexHomeDir, "plugins", "cache", "oh-my-codex-local", "oh-my-codex", version) : undefined);
+  const prunedStaleDirs: string[] = [];
+
+  const configPath = join(selectedCodexHomeDir, "config.toml");
+  const existingConfig = existsSync(configPath) ? await readFile(configPath, "utf-8") : "";
+  const nextConfig = upsertLocalOmxMarketplaceRegistration(
+    upsertLocalOmxPluginEnablement(existingConfig),
+    pkgRoot,
+  );
+  const configUpdated = nextConfig !== existingConfig;
+  if (configUpdated) {
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeFile(configPath, nextConfig, "utf-8");
+  }
+
+  return {
+    status: "prepared",
+    version,
+    cacheDir: currentCacheDir,
+    prunedStaleDirs,
+    configUpdated,
+  };
+}
+
+function isResumeCodexLaunch(args: string[]): boolean {
+  return args.includes("resume");
+}
+
 async function prepareResumeCodexHomeForLaunch(
   cwd: string,
   sessionId: string,
@@ -1161,10 +1241,12 @@ async function prepareResumeCodexHomeForLaunch(
 ): Promise<{ args: string[]; prepared: PreparedCodexHomeForLaunch }> {
   const selection = parseResumeCodexHomeSelection(args);
   if (selection.explicitCodexHome) {
+    const codexHomeOverride = resolve(selection.explicitCodexHome);
+    await preflightResumeOmxPluginState(codexHomeOverride);
     return {
       args: selection.args,
       prepared: {
-        codexHomeOverride: resolve(selection.explicitCodexHome),
+        codexHomeOverride,
       },
     };
   }
@@ -1175,6 +1257,7 @@ async function prepareResumeCodexHomeForLaunch(
       const emptyRuntimeCodexHome = runtimeCodexHomePath(cwd, sessionId);
       await rm(emptyRuntimeCodexHome, { recursive: true, force: true });
       await mkdir(join(emptyRuntimeCodexHome, "sessions"), { recursive: true });
+      await preflightResumeOmxPluginState(emptyRuntimeCodexHome);
       return {
         args: selection.args,
         prepared: {
@@ -1187,6 +1270,7 @@ async function prepareResumeCodexHomeForLaunch(
       includeHistoryArtifacts: true,
       extraHistoryCodexHomes: projectHomes.slice(1).map((home) => home.path),
     });
+    await preflightResumeOmxPluginState(runtimeCodexHome);
     return {
       args: selection.args,
       prepared: {
@@ -1199,6 +1283,7 @@ async function prepareResumeCodexHomeForLaunch(
     includeHistoryArtifacts: true,
     extraHistoryCodexHomes: projectHomes.map((home) => home.path),
   });
+  await preflightResumeOmxPluginState(prepared.codexHomeOverride);
   return { args: selection.args, prepared };
 }
 
@@ -1997,6 +2082,60 @@ export function resolveDisposableWorktreeOmxRootForLaunch(
   return ensuredWorktree.repoRoot;
 }
 
+interface MadmaxWorktreeRuntimeContext {
+  omxRoot: string;
+  omxStateRoot?: string;
+  sourceCwd: string;
+  worktreeCwd?: string;
+  madmaxDetachedContext?: string;
+  boxedActive?: true;
+}
+
+function buildMadmaxWorktreeRuntimeEnvOverlay(
+  runtimeContext?: MadmaxWorktreeRuntimeContext,
+): NodeJS.ProcessEnv {
+  if (!runtimeContext) return {};
+  return {
+    OMX_ROOT: runtimeContext.omxRoot,
+    ...(runtimeContext.omxStateRoot ? { OMX_STATE_ROOT: runtimeContext.omxStateRoot } : {}),
+    ...(runtimeContext.boxedActive ? { OMXBOX_ACTIVE: "1" } : {}),
+    OMX_SOURCE_CWD: runtimeContext.sourceCwd,
+    ...(runtimeContext.madmaxDetachedContext
+      ? { [OMX_MADMAX_DETACHED_CONTEXT_ENV]: runtimeContext.madmaxDetachedContext }
+      : {}),
+  };
+}
+
+export function captureMadmaxWorktreeRuntimeContext(options: {
+  originalLaunchArgs: readonly string[];
+  worktreeEnabled: boolean;
+  sourceCwd: string;
+  worktreeCwd?: string;
+  env?: NodeJS.ProcessEnv;
+}): MadmaxWorktreeRuntimeContext | undefined {
+  const env = options.env ?? process.env;
+  if (!options.worktreeEnabled) return undefined;
+  if (!launchArgsRequestMadmaxIsolation(options.originalLaunchArgs)) return undefined;
+  if (env.OMXBOX_ACTIVE !== "1") return undefined;
+
+  const inheritedRoot = resolveInheritedMadmaxRoot(env);
+  if (!inheritedRoot) return undefined;
+
+  const sourceCwd = env.OMX_SOURCE_CWD?.trim() || options.sourceCwd;
+  const worktreeCwd = options.worktreeCwd?.trim();
+  const omxStateRoot = env.OMX_STATE_ROOT?.trim();
+  const madmaxDetachedContext = env[OMX_MADMAX_DETACHED_CONTEXT_ENV]?.trim();
+
+  return {
+    omxRoot: resolveLaunchPath(options.sourceCwd, inheritedRoot),
+    ...(omxStateRoot ? { omxStateRoot: resolveLaunchPath(options.sourceCwd, omxStateRoot) } : {}),
+    sourceCwd,
+    ...(worktreeCwd && worktreeCwd !== sourceCwd ? { worktreeCwd } : {}),
+    ...(madmaxDetachedContext ? { madmaxDetachedContext } : {}),
+    boxedActive: true,
+  };
+}
+
 function applyDisposableWorktreeOmxRootForLaunch(
   ensuredWorktree: { enabled: true; repoRoot: string } | { enabled: false } | undefined,
   env: NodeJS.ProcessEnv = process.env,
@@ -2009,15 +2148,53 @@ function applyDisposableWorktreeOmxRootForLaunch(
   env.OMX_ROOT = omxRootOverride;
 }
 
+function launchArgRequestsDisposableWorktree(arg: string): boolean {
+  return arg === "--worktree" ||
+    arg === "-w" ||
+    arg.startsWith("--worktree=") ||
+    // Covers both `-w=<name>` and `-w<name>`; an explicit `-w=` check would be a
+    // strict subset of this clause, so it is omitted as redundant.
+    (arg.startsWith("-w") && arg.length > 2);
+}
+
+function launchArgsRequestMadmaxIsolation(launchArgs: readonly string[]): boolean {
+  return launchArgs.some(
+    (arg) => arg === MADMAX_FLAG || arg === MADMAX_SPARK_FLAG,
+  );
+}
+
+function launchArgsRequestDisposableWorktree(launchArgs: readonly string[]): boolean {
+  return launchArgs.some((arg) => launchArgRequestsDisposableWorktree(arg));
+}
+
+function clearInheritedMadmaxRootForDisposableWorktreeLaunch(
+  launchArgs: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (!launchArgsRequestDisposableWorktree(launchArgs)) return;
+  if (env.OMXBOX_ACTIVE !== "1") return;
+  delete env.OMX_ROOT;
+  delete env.OMX_STATE_ROOT;
+  delete env.OMXBOX_ACTIVE;
+  delete env.OMX_SOURCE_CWD;
+  delete env[OMX_MADMAX_DETACHED_CONTEXT_ENV];
+}
+
 export function shouldAutoIsolateMadmaxLaunch(
   command: string,
   launchArgs: string[],
   env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
 ): boolean {
   if (command !== "launch" && command !== "exec") return false;
-  if (env.OMX_NO_BOX === "1" || env.OMXBOX_ACTIVE === "1") return false;
-  if (env.OMX_ROOT || env.OMX_STATE_ROOT) return false;
-  return launchArgs.some((arg) => arg === MADMAX_FLAG || arg === MADMAX_SPARK_FLAG);
+  if (env.OMX_NO_BOX === "1") return false;
+  if (!launchArgsRequestMadmaxIsolation(launchArgs)) return false;
+  const inheritedContext = env[OMX_MADMAX_DETACHED_CONTEXT_ENV]?.trim();
+  if (env.OMXBOX_ACTIVE === "1" && inheritedContext && !resolveInheritedMadmaxRoot(env)) {
+    return false;
+  }
+  if (madmaxInheritedContextMatchesLaunch(cwd, launchArgs, env)) return false;
+  return true;
 }
 
 function sanitizeRunIdSegment(value: string): string {
@@ -2052,6 +2229,7 @@ interface MadmaxDetachedActiveRecord {
   context_key: string;
   created_at: string;
   source_cwd: string;
+  worktree_cwd?: string;
   argv: string[];
   run_dir: string;
   tmux_session_name: string;
@@ -2166,6 +2344,7 @@ function readMadmaxDetachedActiveRecord(
       tmux_session_name: parsed.tmux_session_name,
       ...(typeof parsed.session_id === "string" ? { session_id: parsed.session_id } : {}),
       ...(typeof parsed.tmux_pane_id === "string" ? { tmux_pane_id: parsed.tmux_pane_id } : {}),
+      ...(typeof parsed.worktree_cwd === "string" ? { worktree_cwd: parsed.worktree_cwd } : {}),
     };
   } catch {
     return null;
@@ -2309,6 +2488,48 @@ export function withMadmaxDetachedContextLock<T>(
   );
 }
 
+function readMadmaxRunMetadata(
+  runRoot: string,
+): { cwd?: string; detached_launch_context?: string } | null {
+  try {
+    const parsed = JSON.parse(readFileSync(join(runRoot, ".omxbox-run.json"), "utf-8")) as {
+      cwd?: unknown;
+      detached_launch_context?: unknown;
+    };
+    return {
+      ...(typeof parsed.cwd === "string" ? { cwd: parsed.cwd } : {}),
+      ...(typeof parsed.detached_launch_context === "string"
+        ? { detached_launch_context: parsed.detached_launch_context }
+        : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function resolveInheritedMadmaxRoot(env: NodeJS.ProcessEnv): string | undefined {
+  const root = env.OMX_ROOT?.trim() || env.OMX_STATE_ROOT?.trim();
+  return root || undefined;
+}
+
+function madmaxInheritedContextMatchesLaunch(
+  cwd: string,
+  launchArgs: readonly string[],
+  env: NodeJS.ProcessEnv,
+): boolean {
+  if (env.OMXBOX_ACTIVE !== "1") return false;
+  const context = env[OMX_MADMAX_DETACHED_CONTEXT_ENV]?.trim();
+  if (!context) return false;
+  const inheritedRoot = resolveInheritedMadmaxRoot(env);
+  if (!inheritedRoot) return false;
+  const metadata = readMadmaxRunMetadata(inheritedRoot);
+  if (!metadata) return false;
+  if (metadata.cwd && metadata.cwd !== inheritedRoot) return false;
+  if (metadata.detached_launch_context !== context) return false;
+  const expectedContext = buildMadmaxDetachedLaunchContextKey(cwd, [...launchArgs], inheritedRoot);
+  return expectedContext === context;
+}
+
 function isMadmaxDetachedGuardEnabled(env: NodeJS.ProcessEnv): boolean {
   return env.OMXBOX_ACTIVE === "1" && typeof env[OMX_MADMAX_DETACHED_CONTEXT_ENV] === "string";
 }
@@ -2370,7 +2591,7 @@ function activateMadmaxIsolationIfNeeded(
   cwd: string,
   env: NodeJS.ProcessEnv = process.env,
 ): void {
-  if (!shouldAutoIsolateMadmaxLaunch(command, launchArgs, env)) return;
+  if (!shouldAutoIsolateMadmaxLaunch(command, launchArgs, env, cwd)) return;
   const runDir = createMadmaxIsolatedRoot(cwd, launchArgs, env);
   env.OMX_ROOT = runDir;
   env.OMXBOX_ACTIVE = "1";
@@ -2837,6 +3058,7 @@ export async function launchWithAuthHotswap(args: string[]): Promise<void> {
       }
     }
   }
+  clearInheritedMadmaxRootForDisposableWorktreeLaunch(parsedWorktree.remainingArgs);
   applyDisposableWorktreeOmxRootForLaunch(ensuredLaunchWorktree);
 
   try {
@@ -2958,6 +3180,14 @@ export async function launchWithHud(args: string[]): Promise<void> {
       }
     }
   }
+  const madmaxWorktreeRuntimeContext = captureMadmaxWorktreeRuntimeContext({
+    originalLaunchArgs: args,
+    worktreeEnabled: Boolean(parsedWorktree.mode.enabled && ensuredLaunchWorktree?.enabled),
+    sourceCwd: launchCwd,
+    worktreeCwd: ensuredLaunchWorktree?.enabled ? ensuredLaunchWorktree.worktreePath : undefined,
+    env: process.env,
+  });
+  clearInheritedMadmaxRootForDisposableWorktreeLaunch(parsedWorktree.remainingArgs);
   applyDisposableWorktreeOmxRootForLaunch(ensuredLaunchWorktree);
 
   const sessionId = `omx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -2993,14 +3223,14 @@ export async function launchWithHud(args: string[]): Promise<void> {
     // Non-fatal: repair failure must not block launch
   }
 
-  const resumePrepared = normalizedArgs[0] === "resume"
+  const resumePrepared = isResumeCodexLaunch(normalizedArgs)
     ? await prepareResumeCodexHomeForLaunch(launchCwd, sessionId, normalizedArgs, process.env)
     : null;
   if (resumePrepared) {
     normalizedArgs = resumePrepared.args;
   }
   const preparedCodexHome = resumePrepared?.prepared ?? await prepareCodexHomeForLaunch(launchCwd, sessionId, process.env, {
-    includeHistoryArtifacts: normalizedArgs[0] === "resume",
+    includeHistoryArtifacts: isResumeCodexLaunch(normalizedArgs),
   });
   const codexHomeOverride = preparedCodexHome.codexHomeOverride;
   const sqliteHomeOverride = preparedCodexHome.sqliteHomeOverride;
@@ -3033,6 +3263,7 @@ export async function launchWithHud(args: string[]): Promise<void> {
       effectiveExplicitLaunchPolicy,
       projectLocalCodexHomeForCleanup,
       preparedCodexHome.runtimeCodexHomeForCleanup,
+      madmaxWorktreeRuntimeContext,
     );
     postLaunchHandledExternally = launchResult.postLaunchHandledExternally;
   } finally {
@@ -3084,6 +3315,7 @@ export async function execWithOverlay(args: string[]): Promise<void> {
     }
   }
 
+  clearInheritedMadmaxRootForDisposableWorktreeLaunch(parsedWorktree.remainingArgs);
   applyDisposableWorktreeOmxRootForLaunch(ensuredLaunchWorktree);
 
   const sessionId = `omx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -4035,6 +4267,7 @@ export function buildDetachedSessionBootstrapSteps(
   env: NodeJS.ProcessEnv = process.env,
   sqliteHomeOverride?: string,
   parentEnvFilePath?: string,
+  inheritedWorkerModel?: string | null,
 ): DetachedSessionTmuxStep[] {
   const detachedLeaderCmd = nativeWindows
     ? "powershell.exe"
@@ -4077,17 +4310,19 @@ export function buildDetachedSessionBootstrapSteps(
     sessionName,
     "-c",
     cwd,
-    ...(workerLaunchArgs
-      ? ["-e", `${TEAM_WORKER_LAUNCH_ARGS_ENV}=${workerLaunchArgs}`]
-      : []),
+    ...(workerLaunchArgs ? ["-e", `${TEAM_WORKER_LAUNCH_ARGS_ENV}=${workerLaunchArgs}`] : []),
     ...Object.entries(hudRuntimeEnv).map(([key, value]) => ["-e", `${key}=${value}`]).flat(),
     ...(codexHomeOverride ? ["-e", `CODEX_HOME=${codexHomeOverride}`] : []),
     ...(sqliteHomeOverride ? ["-e", `${CODEX_SQLITE_HOME_ENV}=${sqliteHomeOverride}`] : []),
     ...(env.OMXBOX_ACTIVE ? ["-e", `OMXBOX_ACTIVE=${env.OMXBOX_ACTIVE}`] : []),
     ...(env.OMX_SOURCE_CWD ? ["-e", `OMX_SOURCE_CWD=${env.OMX_SOURCE_CWD}`] : []),
+    ...(env[OMX_MADMAX_DETACHED_CONTEXT_ENV]
+      ? ["-e", `${OMX_MADMAX_DETACHED_CONTEXT_ENV}=${env[OMX_MADMAX_DETACHED_CONTEXT_ENV]}`]
+      : []),
     ...(notifyTempContractRaw
       ? ["-e", `${OMX_NOTIFY_TEMP_CONTRACT_ENV}=${notifyTempContractRaw}`]
       : []),
+    ...(inheritedWorkerModel ? ["-e", `${TEAM_WORKER_INHERITED_MODEL_ENV}=${inheritedWorkerModel}`] : []),
     detachedLeaderCmd,
   ];
   const splitCaptureArgs: string[] = [
@@ -4908,6 +5143,7 @@ function runCodex(
   explicitLaunchPolicy?: CodexLaunchPolicy,
   projectLocalCodexHomeForCleanup?: string,
   runtimeCodexHomeForCleanup?: string,
+  runtimeContext?: MadmaxWorktreeRuntimeContext,
 ): { postLaunchHandledExternally: boolean } {
   const launchArgs = injectModelInstructionsBypassArgs(
     cwd,
@@ -4920,18 +5156,29 @@ function runCodex(
   if (!omxBin) {
     throw new Error("Unable to resolve OMX launcher path for tmux HUD bootstrap");
   }
-  const omxRootOverride = resolveOmxRootForLaunch(cwd, process.env);
+  const runtimeEnvOverlay = buildMadmaxWorktreeRuntimeEnvOverlay(runtimeContext);
+  const omxRootOverride = runtimeContext?.omxRoot ?? resolveOmxRootForLaunch(cwd, process.env);
   const currentPaneId = process.env.TMUX_PANE;
-  const hudRuntimeRoot = resolveHudRuntimeRootForLaunch(cwd, process.env);
-  const hudEnvArgs = Object.entries(buildHudRuntimeEnv({
-    sessionId,
-    leaderPaneId: currentPaneId,
-    ...hudRuntimeRoot,
-  }).env).map(([key, value]) => `${key}=${value}`);
+  const hudRuntimeRoot: HudRuntimeRootForLaunch = runtimeContext
+    ? { omxRoot: runtimeContext.omxRoot, rootSource: 'omx-root-env' }
+    : resolveHudRuntimeRootForLaunch(cwd, process.env);
+  const hudRuntimeEnv = {
+    ...buildHudRuntimeEnv({
+      sessionId,
+      leaderPaneId: currentPaneId,
+      ...hudRuntimeRoot,
+    }).env,
+    ...runtimeEnvOverlay,
+  };
+  const hudEnvArgs = Object.entries(hudRuntimeEnv).map(([key, value]) => `${key}=${value}`);
   const hudCmd = nativeWindows
     ? buildWindowsPromptCommand("node", [omxBin, "hud", "--watch"])
     : buildTmuxPaneCommand("env", [...hudEnvArgs, "node", omxBin, "hud", "--watch"]);
   const inheritLeaderFlags = process.env[TEAM_INHERIT_LEADER_FLAGS_ENV] !== "0";
+  const inheritedWorkerLaunchArgs = inheritLeaderFlags
+    ? collectInheritableTeamWorkerArgsShared(launchArgs)
+    : [];
+  const inheritedWorkerModel = parseTeamWorkerLaunchArgs(inheritedWorkerLaunchArgs).modelOverride ?? undefined;
   const workerLaunchArgs = resolveTeamWorkerLaunchArgsEnv(
     process.env[TEAM_WORKER_LAUNCH_ARGS_ENV],
     launchArgs,
@@ -4945,6 +5192,7 @@ function runCodex(
       ...(codexHomeOverride ? { CODEX_HOME: codexHomeOverride } : {}),
       ...(sqliteHomeOverride ? { [CODEX_SQLITE_HOME_ENV]: sqliteHomeOverride } : {}),
       ...(omxRootOverride ? { OMX_ROOT: omxRootOverride } : {}),
+      ...runtimeEnvOverlay,
     },
     omxBin,
   );
@@ -4953,11 +5201,16 @@ function runCodex(
     ...buildHudRuntimeEnv({ sessionId }).env,
   };
   const codexEnv = workerLaunchArgs
-    ? { ...codexEnvWithSession, [TEAM_WORKER_LAUNCH_ARGS_ENV]: workerLaunchArgs }
+    ? {
+        ...codexEnvWithSession,
+        [TEAM_WORKER_LAUNCH_ARGS_ENV]: workerLaunchArgs,
+        ...(inheritedWorkerModel ? { [TEAM_WORKER_INHERITED_MODEL_ENV]: inheritedWorkerModel } : {}),
+      }
     : codexEnvWithSession;
   const codexEnvWithNotify = notifyTempContractRaw
     ? { ...codexEnv, [OMX_NOTIFY_TEMP_CONTRACT_ENV]: notifyTempContractRaw }
     : codexEnv;
+  const runtimeHookEnv = { ...process.env, ...runtimeEnvOverlay };
 
   const { launchPolicy } = resolveTmuxAwareLaunchPolicy(
     explicitLaunchPolicy,
@@ -5003,6 +5256,7 @@ function runCodex(
           cwd,
           sessionId,
           omxRootOverride,
+          baseEnv: runtimeHookEnv,
         });
       } catch (err) {
         logCliOperationFailure(err);
@@ -5030,6 +5284,7 @@ function runCodex(
           cwd,
           sessionId,
           omxRootOverride,
+          baseEnv: runtimeHookEnv,
         });
       } catch (err) {
         logCliOperationFailure(err);
@@ -5096,7 +5351,7 @@ function runCodex(
       : null;
     const sessionName = buildDetachedTmuxSessionName(cwd, sessionId);
     const launchDetachedSession = (): { postLaunchHandledExternally: boolean } => {
-      const contextKey = process.env[OMX_MADMAX_DETACHED_CONTEXT_ENV]?.trim();
+      const contextKey = runtimeContext?.madmaxDetachedContext ?? process.env[OMX_MADMAX_DETACHED_CONTEXT_ENV]?.trim();
       const runsRoot = resolveMadmaxRunsRoot(process.env);
       const activeRecordPath = contextKey
         ? madmaxDetachedActiveRecordPath(runsRoot, contextKey)
@@ -5194,9 +5449,10 @@ function runCodex(
           projectLocalCodexHomeForCleanup,
           runtimeCodexHomeForCleanup,
           omxRootOverride,
-          process.env,
+          runtimeHookEnv,
           sqliteHomeOverride,
           detachedParentEnvFilePath,
+          inheritedWorkerModel,
         );
         for (const step of bootstrapSteps) {
           const output = execTmuxFileSync(step.args, {
@@ -5214,9 +5470,10 @@ function runCodex(
                   version: 1,
                   context_key: contextKey,
                   created_at: new Date().toISOString(),
-                  source_cwd: process.env.OMX_SOURCE_CWD || cwd,
+                  source_cwd: runtimeContext?.sourceCwd ?? process.env.OMX_SOURCE_CWD ?? cwd,
+                  ...(runtimeContext?.worktreeCwd ? { worktree_cwd: runtimeContext.worktreeCwd } : {}),
                   argv: args,
-                  run_dir: process.env.OMX_ROOT || cwd,
+                  run_dir: runtimeContext?.omxRoot ?? process.env.OMX_ROOT ?? cwd,
                   tmux_session_name: sessionName,
                   session_id: sessionId,
                   tmux_pane_id: leaderPaneId,
@@ -5316,6 +5573,7 @@ function runCodex(
                   sessionId,
                   omxBin,
                   omxRootOverride,
+                  baseEnv: runtimeHookEnv,
                 });
               }
             }
@@ -6295,6 +6553,7 @@ async function listHookVisibleRunDirStateRefs(cwd: string): Promise<ModeStateFil
     if (!raw || typeof raw !== "object") return;
     const record = raw as Record<string, unknown>;
     const sourceCwd = typeof record.source_cwd === "string" ? record.source_cwd.trim() : "";
+    const worktreeCwd = typeof record.worktree_cwd === "string" ? record.worktree_cwd.trim() : "";
     const runDir = typeof record.run_dir === "string"
       ? record.run_dir.trim()
       : typeof record.cwd === "string"
@@ -6303,7 +6562,10 @@ async function listHookVisibleRunDirStateRefs(cwd: string): Promise<ModeStateFil
     if (!sourceCwd || !runDir) return;
 
     try {
-      if (canonicalizePathForRunDirMatch(sourceCwd) !== canonicalCwd) return;
+      if (
+        canonicalizePathForRunDirMatch(sourceCwd) !== canonicalCwd &&
+        (!worktreeCwd || canonicalizePathForRunDirMatch(worktreeCwd) !== canonicalCwd)
+      ) return;
       const resolvedRunDir = resolve(runDir);
       if (
         resolvedRunDir !== canonicalRunsRoot
