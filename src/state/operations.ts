@@ -7,6 +7,7 @@ import {
   getAllScopedStatePaths,
   getAuthoritativeActiveStateDirs,
   getBaseStateDir,
+  getBaseStateDirWithSource,
   getReadScopedStateDirs,
   getReadScopedStatePaths,
   getStateDir,
@@ -16,11 +17,13 @@ import {
   resolveWorkingDirectoryForState,
   validateSessionId,
   validateStateModeSegment,
+  type StateRootSource,
 } from '../mcp/state-paths.js';
 import { evaluateRalphCompletionAuditEvidence } from '../ralph/completion-audit.js';
 import { ensureCanonicalRalphArtifacts } from '../ralph/persistence.js';
 import { RALPH_PHASES, validateAndNormalizeRalphState } from '../ralph/contract.js';
 import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
+import { normalizeTerminalWorkflowState } from './terminal-normalization.js';
 import {
   hasCleanAutopilotReviewAndQaEvidence,
   isAutopilotSuccessfulTerminalState,
@@ -59,6 +62,9 @@ import {
   buildAutopilotRalplanUltragoalGateError,
   canAdvanceAutopilotRalplanToUltragoal,
 } from '../autopilot/ralplan-gate.js';
+import {
+  isUnsupportedNativeSubagentEvidenceForScope,
+} from '../leader/contract.js';
 import {
   buildRalplanConsensusGateFromSources,
 } from '../ralplan/consensus-gate.js';
@@ -210,11 +216,16 @@ function validateStrictReadableMode(mode: unknown): string {
   return normalized;
 }
 
-async function initializeStateEnvironment(cwd: string, effectiveSessionId?: string): Promise<void> {
+async function initializeStateEnvironment(
+  cwd: string,
+  effectiveSessionId?: string,
+  rootSource?: StateRootSource,
+): Promise<void> {
   await mkdir(getStateDir(cwd), { recursive: true });
   if (effectiveSessionId) {
     await mkdir(getStateDir(cwd, effectiveSessionId), { recursive: true });
   }
+  if (rootSource === 'team-env') return;
   const { ensureTmuxHookInitialized } = await import('../cli/tmux-hook.js');
   await ensureTmuxHookInitialized(cwd);
 }
@@ -290,8 +301,61 @@ function isCompleteRalplanTerminalState(state: Record<string, unknown>): boolean
 }
 
 function isRalplanCompleteCloseoutAttempt(state: Record<string, unknown>): boolean {
-  const currentPhase = stringValue(state.current_phase).trim().toLowerCase();
-  return state.active === false && currentPhase === 'complete';
+  return state.active === false && hasCleanTerminalValue(state);
+}
+function stateContainsUnsupportedNativeSubagentEvidence(
+  state: Record<string, unknown>,
+  input: { cwd?: string; sessionId?: string } = {},
+): boolean {
+  const nestedState = objectRecord(state.state);
+  const handoffArtifacts = objectRecord(state.handoff_artifacts);
+  const nestedHandoffArtifacts = objectRecord(nestedState.handoff_artifacts);
+  const ralplanHandoff = objectRecord(handoffArtifacts.ralplan);
+  const nestedRalplanHandoff = objectRecord(nestedHandoffArtifacts.ralplan);
+  return isUnsupportedNativeSubagentEvidenceForScope(state.native_subagent_support, input)
+    || isUnsupportedNativeSubagentEvidenceForScope(nestedState.native_subagent_support, input)
+    || isUnsupportedNativeSubagentEvidenceForScope(handoffArtifacts.native_subagent_support, input)
+    || isUnsupportedNativeSubagentEvidenceForScope(nestedHandoffArtifacts.native_subagent_support, input)
+    || isUnsupportedNativeSubagentEvidenceForScope(ralplanHandoff.native_subagent_support, input)
+    || isUnsupportedNativeSubagentEvidenceForScope(nestedRalplanHandoff.native_subagent_support, input);
+}
+
+function hasNonCleanTerminalValue(state: Record<string, unknown>): boolean {
+  const terminalValues = new Set(['blocked', 'cancelled', 'failed']);
+  return terminalValues.has(stringValue(state.current_phase).trim().toLowerCase())
+    || terminalValues.has(stringValue(state.status).trim().toLowerCase())
+    || terminalValues.has(stringValue(state.outcome).trim().toLowerCase())
+    || terminalValues.has(stringValue(state.terminal_outcome).trim().toLowerCase())
+    || terminalValues.has(stringValue(state.lifecycle_outcome).trim().toLowerCase())
+    || terminalValues.has(stringValue(state.run_outcome).trim().toLowerCase());
+}
+
+function hasCleanTerminalValue(state: Record<string, unknown>): boolean {
+  const terminalValues = [
+    state.current_phase,
+    state.status,
+    state.outcome,
+    state.terminal_outcome,
+    state.lifecycle_outcome,
+    state.run_outcome,
+  ];
+  return terminalValues.some((value) => stringValue(value).trim().toLowerCase() === 'complete');
+}
+
+function hasCompleteRalplanConsensusGate(state: Record<string, unknown>): boolean {
+  const nestedState = objectRecord(state.state);
+  return objectRecord(state.ralplan_consensus_gate).complete === true
+    || objectRecord(nestedState.ralplan_consensus_gate).complete === true;
+}
+
+function isApprovedUnsupportedNativeNonCleanRecoveryState(
+  state: Record<string, unknown>,
+  input: { cwd?: string; sessionId?: string } = {},
+): boolean {
+  if (state.active !== false) return false;
+  if (hasCleanTerminalValue(state)) return false;
+  if (hasCompleteRalplanConsensusGate(state)) return false;
+  return stateContainsUnsupportedNativeSubagentEvidence(state, input) && hasNonCleanTerminalValue(state);
 }
 
 export function validateRalplanTerminalConsensus(
@@ -301,6 +365,9 @@ export function validateRalplanTerminalConsensus(
   options: { requireNativeSubagents?: boolean } = {},
 ): string | null {
   if (!isRalplanCompleteCloseoutAttempt(state)) return null;
+  if (stateContainsUnsupportedNativeSubagentEvidence(state, { cwd, sessionId })) {
+    return 'Cannot complete ralplan cleanly while native subagent support is unavailable; terminalize the workflow as blocked/cancelled/failed or restart in a runtime with working native subagents.';
+  }
   const stateSessionId = sessionId ?? optionalSessionId(state.session_id);
   const gate = buildRalplanConsensusGateFromSources([
     { source: 'state-write-ralplan-terminal', value: state, sessionId: stateSessionId },
@@ -696,10 +763,10 @@ export async function executeStateOperation(
       case 'state_write': {
         const stateScope = await resolveStateScope(cwd, explicitSessionId);
         const effectiveSessionId = stateScope.sessionId;
-        await initializeStateEnvironment(cwd, effectiveSessionId);
+        const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
+        await initializeStateEnvironment(cwd, effectiveSessionId, rootSource);
 
         const mode = validateStateModeSegment(rawArgs.mode);
-        const baseStateDir = getBaseStateDir(cwd);
         const path = getStatePath(mode, cwd, effectiveSessionId);
         const {
           mode: _mode,
@@ -782,13 +849,16 @@ export async function executeStateOperation(
               return;
             }
             Object.assign(mergedRaw, runOutcomeValidation.state);
+            const terminalNormalization = normalizeTerminalWorkflowState(mergedRaw, { mode });
+            Object.assign(mergedRaw, terminalNormalization.state);
           }
 
           if (mode === 'autopilot') {
             normalizeCleanAutopilotCompletionEvidence(mergedRaw);
           }
 
-          if (mode === 'ralplan') {
+          const unsupportedNativeNonCleanRecovery = isApprovedUnsupportedNativeNonCleanRecoveryState(mergedRaw, { cwd, sessionId: effectiveSessionId });
+          if (mode === 'ralplan' && !unsupportedNativeNonCleanRecovery) {
             validationError = validateRalplanTerminalConsensus(cwd, mergedRaw, effectiveSessionId, {
               requireNativeSubagents: true,
             });
@@ -798,7 +868,7 @@ export async function executeStateOperation(
           const currentAutopilotChildPhase = mode === 'autopilot'
             ? deriveAutopilotChildPhase({ mode: 'autopilot', ...existing })
             : null;
-          const nextAutopilotChildPhase = mode === 'autopilot'
+          let nextAutopilotChildPhase = mode === 'autopilot'
             ? deriveAutopilotChildPhase({ mode: 'autopilot', ...mergedRaw })
             : null;
 
@@ -818,6 +888,14 @@ export async function executeStateOperation(
           ) {
             validationError = 'Cannot complete Autopilot before ultragoal gate: ralplan may only advance to ultragoal.';
             return;
+          }
+
+          if (
+            mode === 'autopilot'
+            && currentAutopilotChildPhase === 'ralplan'
+            && unsupportedNativeNonCleanRecovery
+          ) {
+            nextAutopilotChildPhase = currentAutopilotChildPhase;
           }
 
           if (mode === 'autopilot') {
@@ -936,13 +1014,15 @@ export async function executeStateOperation(
             await ensureCanonicalRalphArtifacts(cwd, effectiveSessionId);
           }
           const data = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
-          const ralplanCompletionHandled = mode === 'ralplan' && await completeRalplanSession({
-            cwd,
-            baseStateDir,
-            state: data,
-            explicitSessionId: effectiveSessionId,
-            requireNativeSubagents: true,
-          });
+          const ralplanCompletionHandled = mode === 'ralplan'
+            && !isApprovedUnsupportedNativeNonCleanRecoveryState(data, { cwd, sessionId: effectiveSessionId })
+            && await completeRalplanSession({
+              cwd,
+              baseStateDir,
+              state: data,
+              explicitSessionId: effectiveSessionId,
+              requireNativeSubagents: true,
+            });
           if (!ralplanCompletionHandled) {
             await syncCanonicalSkillStateForMode({
               cwd,
@@ -969,10 +1049,10 @@ export async function executeStateOperation(
       case 'state_clear': {
         const stateScope = await resolveStateScope(cwd, explicitSessionId);
         const effectiveSessionId = stateScope.sessionId;
-        await initializeStateEnvironment(cwd, effectiveSessionId);
+        const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
+        await initializeStateEnvironment(cwd, effectiveSessionId, rootSource);
 
         const mode = validateStateModeSegment(rawArgs.mode);
-        const baseStateDir = getBaseStateDir(cwd);
         const allSessions = rawArgs.all_sessions === true;
 
         if (!allSessions) {

@@ -1,30 +1,22 @@
-# oh-my-codex 0.19.0
+# oh-my-codex 0.20.0
 
-> Release status: candidate. Publication proof is recorded in `docs/qa/release-readiness-0.19.0.md`; this body is finalized after dev/main CI, tag workflow, GitHub release, native asset, and npm publication evidence are complete.
-
-`0.19.0` is a reliability and safety-hardening release after `0.18.17`. It preserves the existing CLI/package/plugin contract while locking down planning-gate and handoff-artifact execution transports, hardening the conductor contract and typed subagent/lane provenance, tightening Ralplan consensus/terminal-state handling, fixing madmax worktree and resume paths, and eliminating a long-standing parallel-test flake in the Rust suite.
+`0.20.0` migrates the entire OMX model contract to OpenAI's GPT-5.6 generation (Sol/Terra/Luna).
 
 ## Highlights
 
-- Lock down planning-gate and handoff-artifact execution transports while still allowing legitimate deep-interview→ralplan artifact handoff.
-- Harden the conductor contract, typed subagent provenance, typed-lane fences, shell-guard target parsing, and conductor reuse ledger.
-- Tighten Ralplan consensus review evidence, terminal closeout state writes, and heredoc redirect scanning.
-- Fix Autopilot ralplan handoff, madmax worktree runtime roots, and madmax resume plugin cache preflight.
-- Render superseded Ultragoal goals correctly in the HUD.
-- Eliminate the intermittent Rust sparkshell test flake by making `unique_temp_dir()` collision-proof under parallel same-process execution.
+- Frontier lane `gpt-5.6-sol`, standard lane `gpt-5.6-terra`, spark lane `gpt-5.6-luna` across runtime, agents, Rust crates, docs, prompts, skills, and the plugin mirror.
+- Planner/architect exact `gpt-5.6-sol` pins (medium/xhigh); researcher exact `gpt-5.6-terra`; fast lanes on `gpt-5.6-luna`.
+- Exact-model composition seam retargeted to `gpt-5.6-terra` with final-resolved-model precedence.
+- Setup offers prompt-gated upgrades from legacy `gpt-5.3-codex` / `gpt-5.5` to `gpt-5.6-sol`.
+- Autopilot classifies canonical Terra/Luna as cheap planning lanes.
+- Doctor reports accurate Spark model sources including `models.team_low_complexity`.
 
 ## Compatibility
 
-No breaking CLI, package, plugin-layout, or configuration changes are intended.
+No breaking CLI, package, plugin-layout, or configuration changes. Existing explicit model overrides keep their semantics as opaque strings.
 
 ## Validation
 
-Release readiness evidence is recorded in `docs/qa/release-readiness-0.19.0.md`.
+Green dev CI, full node + Rust suites, three architect review rounds ending CLEAR/APPROVE, adversarial QA/red-team artifacts.
 
-Release-prep gates include version sync for `v0.19.0`, build, native-agent verification, plugin mirror/bundle checks, catalog docs check, the full Rust and node test suites (Rust rerun repeatedly to prove the flake fix), `npm pack --dry-run`, and `git diff --check`. Branch CI, dev/main promotion, tag-triggered release workflow, GitHub release proof, and npm publication proof are appended to readiness evidence after publication.
-
-## Contributors
-
-Thanks to the contributors who made this release possible.
-
-**Full Changelog**: [`v0.18.17...v0.19.0`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.18.17...v0.19.0)
+**Full Changelog**: [`v0.19.1...v0.20.0`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.19.1...v0.20.0)
