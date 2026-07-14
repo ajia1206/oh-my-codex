@@ -30,8 +30,9 @@ import {
 } from "./explore.js";
 import { getPackageRoot } from "../utils/package.js";
 import {
+	analyzeLegacyMultiAgentConfig,
+	hasExactOmxSeededBehavioralDefaultsPair,
 	hasLegacyOmxTeamRunTable,
-	getModelContextRecommendation,
 } from "../config/generator.js";
 import {
 	MANAGED_HOOK_EVENTS,
@@ -325,13 +326,21 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	checks.push(checkDirectory("Codex home", paths.codexHomeDir));
 
 	// Check 4: Config file
-	checks.push(await checkConfig(paths.configPath));
-
-	// Check 4.1: Model context recommendation
-	const contextRecommendationCheck = await checkModelContextRecommendation(
+	const configCheck = await checkConfig(paths.configPath);
+	checks.push(configCheck);
+	const multiAgentCompatibilityCheck = await checkLegacyMultiAgentCompatibility(
 		paths.configPath,
+		scopeResolution.scope,
 	);
-	if (contextRecommendationCheck) checks.push(contextRecommendationCheck);
+	if (multiAgentCompatibilityCheck) checks.push(multiAgentCompatibilityCheck);
+
+	// Check 4.1: unchanged OMX-seeded context defaults
+	if (configCheck.status !== "fail") {
+		const seededContextDefaultsCheck = await checkSeededContextDefaults(
+			paths.configPath,
+		);
+		if (seededContextDefaultsCheck) checks.push(seededContextDefaultsCheck);
+	}
 
 	// Check 4.25: Native hooks coverage
 	checks.push(
@@ -1128,6 +1137,41 @@ function validateToml(content: string): string | null {
 	}
 }
 
+export async function checkLegacyMultiAgentCompatibility(
+	configPath: string,
+	scope: DoctorSetupScope,
+): Promise<Check | null> {
+	if (!existsSync(configPath)) return null;
+
+	try {
+		const content = await readFile(configPath, "utf-8");
+		if (validateToml(content)) return null;
+
+		const affected = Object.values(analyzeLegacyMultiAgentConfig(content).assessments).filter(
+			(assessment) => assessment.state !== "absent",
+		);
+		if (affected.length === 0) return null;
+
+		const details = affected
+			.map(
+				({ key, state, reasonCode }) =>
+					`${key} (${state}; ${reasonCode})`,
+			)
+			.join(", ");
+		return {
+			name: "GPT-5.6 multi-agent compatibility",
+			status: "warn",
+			message:
+				`${scope} scope config at ${configPath}: ${details}. ` +
+				"OMX preserves these settings because historical ownership cannot be proven. " +
+				`Back up ${configPath}, remove only keys you confirm OMX authored, rerun omx setup --scope ${scope}, then omx doctor. ` +
+				"Setup does not auto-delete them.",
+		};
+	} catch {
+		return null;
+	}
+}
+
 async function checkConfig(configPath: string): Promise<Check> {
 	if (!existsSync(configPath)) {
 		return { name: "Config", status: "warn", message: "config.toml not found" };
@@ -1185,59 +1229,20 @@ async function checkConfig(configPath: string): Promise<Check> {
 	}
 }
 
-function formatContextRecommendationWarning(
-	configuredValues: string[],
-	recommendedContextWindow: number,
-	recommendedAutoCompactLimit: number,
-): string {
-	return `${configuredValues.join(
-		", ",
-	)} exceeds the OMX setup recommendation for gpt-5.6-sol (${recommendedContextWindow} / ${recommendedAutoCompactLimit}); doctor does not rewrite user config, so lower these values or verify your active Codex runtime/provider behavior if this customization is intentional`;
-}
-
-async function checkModelContextRecommendation(
+async function checkSeededContextDefaults(
 	configPath: string,
 ): Promise<Check | null> {
 	if (!existsSync(configPath)) return null;
 
 	try {
 		const content = await readFile(configPath, "utf-8");
-		const parsed = parseToml(content) as Record<string, unknown>;
-		const model = parsed.model;
-		if (typeof model !== "string") return null;
-
-		const recommendation = getModelContextRecommendation(model);
-		if (!recommendation) return null;
-
-		const configuredValues: string[] = [];
-		const contextWindow = parsed.model_context_window;
-		if (
-			typeof contextWindow === "number" &&
-			contextWindow > recommendation.modelContextWindow
-		) {
-			configuredValues.push(`model_context_window=${contextWindow}`);
-		}
-
-		const autoCompactLimit = parsed.model_auto_compact_token_limit;
-		if (
-			typeof autoCompactLimit === "number" &&
-			autoCompactLimit > recommendation.modelAutoCompactTokenLimit
-		) {
-			configuredValues.push(
-				`model_auto_compact_token_limit=${autoCompactLimit}`,
-			);
-		}
-
-		if (configuredValues.length === 0) return null;
+		if (!hasExactOmxSeededBehavioralDefaultsPair(content)) return null;
 
 		return {
-			name: "Model context recommendation",
+			name: "Legacy OMX context defaults",
 			status: "warn",
-			message: formatContextRecommendationWarning(
-				configuredValues,
-				recommendation.modelContextWindow,
-				recommendation.modelAutoCompactTokenLimit,
-			),
+			message:
+				"config.toml contains unchanged OMX-seeded context defaults; rerun \"omx setup\" to migrate them. Doctor did not rewrite config.",
 		};
 	} catch {
 		return null;
