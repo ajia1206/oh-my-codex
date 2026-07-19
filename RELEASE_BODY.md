@@ -1,34 +1,38 @@
-# oh-my-codex 0.20.1
+# oh-my-codex 0.20.3
 
-`0.20.1` is a patch release for the reliability fixes in `v0.20.0..9eadab9f191103177fb3eac1b237188ada1f503c`.
+`0.20.3` is a patch release for the reliability and workflow-safety work in the exact range `v0.20.2..f967cfed64ec57614af136f75d7cb81509808f7e`, plus one additive, backward-compatible feature.
 
 ## Highlights
 
-- CRLF-safe generated `AGENTS.md` marker insertion (#3107).
-- Ralplan can write normalized direct-child Markdown draft artifacts under `.omx/drafts/` without relaxing the native planning-write boundary (#3110).
-- Fresh setup stops seeding legacy multi-agent and context-window defaults, leaving user-owned configuration and native role routing intact (#3111, #3115).
-- Stop hook responses remain schema-safe (#3114).
-- Conductor execution recognizes trusted delegated collaboration-child provenance while protecting leader and planning-boundary cases (#3117; issue #3116).
-- Native delegation detection handles incomplete capability inventories safely, and quoted Bash argument values no longer misparse as write targets (#3120; issue #3119).
+- Reasoning effort can be capped per agent through the team model contract (#3143).
+- Team validates exact live tmux panes before explicit lifecycle effects and preserves pane ownership through startup, scaling, rollback, recovery, and teardown, with durable failure-atomic membership/scaling transactions and pane-pid-bound notify dispatch (#3153; issue #3121).
+- Ralplan requires strict direct review order, fails closed without documented leader proof, attests the reconciled leader in `PreToolUse`, and resolves the App leader-proof regression by parsing collaboration results structurally (#3186, #3196, #3187, #3218; issues #3194, #3181, #3204).
+- Team mailbox wakeups are coalesced with every wake acknowledged (#3217; issue #3195), and exact session pointer lock recovery is added (#3215; issue #3203).
+- Native child write identity is hardened across the native hook, code-intel, and wiki MCP surfaces (#3135; issue #3127), and the configuration generator reconciles duplicate project trust tables idempotently (#3201; issue #3199).
+- The plugin native hook returns structured responses for oversized tool-hook payloads (#3211), and Windows regular-file `fsync` `EPERM` is tolerated across hooks, uninstall, and the native hook (#3191).
 
-## Merged PRs since v0.20.0
+## Additional fixes
 
-#3107 (CRLF generated AGENTS marker insertion), #3110 (Ralplan Markdown draft artifact writes), #3111 (legacy multi-agent default seeding), #3114 (schema-safe Stop responses), #3115 (legacy context-default seeding), #3117 (delegated collaboration-child provenance; issue #3116), #3120 (native delegation detection and quoted Bash target parsing; issue #3119).
+- Isolated standard launches are documented in the CLI and README (#3192).
 
-## Prior-release collateral corrections
+## Release collateral
 
-`f644d2cd3ae98587942aa94f0030f083ea0bb10f` corrected the 0.20.0 collateral compare coverage, and `5d43a5bf6f008de17f9425bee4495c457c60b96a` clarified that capabilities preflight is a manual command. These direct commits are prior-release collateral corrections, not 0.20.1 product headlines.
+- `1c007fff`, `122b0cba`, `fb13a6db`, and `0a7baa81` are v0.20.2 post-publish evidence corrections carried forward; they are release-collateral inventory only. `4b557d13` is the 0.20.3 version-development preparation commit.
+
+## Merged PRs since v0.20.2
+
+#3135, #3143, #3153, #3186, #3187, #3191, #3192, #3196, #3201, #3211, #3215, #3217, #3218. Issues #3121, #3127, #3181, #3194, #3195, #3199, #3203, and #3204 are associated issues, not additional PRs.
 
 ## Compatibility
 
-Patch release with no intentional breaking CLI or package-layout changes.
+Patch release with no intentional breaking CLI or package-layout changes; the one feature (#3143) is additive and backward-compatible.
 
 ## Validation
 
-The pre-tag command gates, evidence schema, and pending external CI/publication evidence are declared in `docs/qa/release-readiness-0.20.1.md`. No local gate, review, CI, tag, or publication result is asserted here.
+Local build, lint, typecheck, plugin-bundle, native-agents, and Node test gates for the touched surface are recorded in `docs/qa/release-readiness-0.20.3.md`. External CI, tag, GitHub release, and npm provenance publication evidence is recorded in that same readiness record as the publish sequence completes.
 
 ## Contributors
 
-Thanks to the contributors who made this release possible.
+Thanks to Bellman (@Yeachan-Heo) for commits in this range.
 
-**Full Changelog**: [`v0.20.0...v0.20.1`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.20.0...v0.20.1)
+**Full Changelog**: [`v0.20.2...v0.20.3`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.20.2...v0.20.3)

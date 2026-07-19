@@ -7,12 +7,16 @@ The `ralplan -> ultragoal` transition requires durable Architect and Critic appr
 Each review artifact used by the gate must include:
 
 - `agent_role`: `architect` or `critic`
-- `provenance_kind`: `native_subagent`
+- `provenance_kind`: `native_subagent` from a routing-capable surface; `omx_adapted` is rejected on the documented Codex 0.144.5 boundary
 - `session_id`: the current transition session id, unless supplied by the transition context
 - `thread_id`: the native subagent thread id for that review lane
 - `tracker_path`: `.omx/state/subagent-tracking.json`
 
 The Architect and Critic reviews must approve in order and must refer to distinct native subagent threads.
+
+## Unsupported adapted provenance
+
+When the native tool reports `role_routing_unavailable`, Ralplan must fail its explicit preflight before review work. The consensus gate rejects `omx_adapted` review artifacts even when legacy tracker journals or `native-subagent-role-routing.json` markers remain after an upgrade. Prompt labels, task-name carriers, markers, pending intents, and historical adapted ledger records do not grant review authority. Typed `native_subagent` lanes remain subject to the tracker, completion, distinct-thread, role, and strict Architect-before-Critic checks below.
 
 ## Required tracker schema
 

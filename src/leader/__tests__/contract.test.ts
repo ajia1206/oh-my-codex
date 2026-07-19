@@ -1,5 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   LEADER_CONDUCTOR_BLOCK,
   LEADER_CONDUCTOR_DELEGATION_NOTE,
@@ -10,12 +14,24 @@ import {
   actionKindForConductorArtifact,
   authorizeConductorAction,
   classifyConductorArtifactKind,
+  LEADER_CONDUCTOR_ROLE_ROUTING_DEGRADE_BLOCK,
   LEADER_CONDUCTOR_UNSUPPORTED_NATIVE_DEGRADE_BLOCK,
   NATIVE_SUBAGENT_SUPPORT_BLOCKER_FILE,
+  buildRoleRoutingUnavailableGuidance,
   buildUnsupportedNativeSubagentGuidance,
+  isRoleRoutingUnavailableEvidence,
   isUnsupportedNativeSubagentEvidence,
   isUnsupportedNativeSubagentEvidenceForScope,
+  type RoleRoutingUnavailableMarker,
   resolveNativeSubagentSupportStatus,
+  parseNativeSubagentResultDisposition,
+  NATIVE_SPAWN_TASK_NAME_PATTERN,
+  ROLE_INTENT_SPAWN_TASK_NAME_PREFIX,
+  ROLE_INTENT_CORRELATION_TOKEN_PATTERN,
+  canonicalizeOriginCwd,
+  buildRoleIntentSpawnTaskName,
+  isAppCompatibleSpawnTaskName,
+  parseRoleIntentCorrelationToken,
 } from '../contract.js';
 
 describe('leader conductor contract', () => {
@@ -130,6 +146,49 @@ describe('leader conductor contract', () => {
     );
   });
 
+  it('resolves role routing unavailability from explicit capability and scoped marker evidence', () => {
+    const capabilityEvidence = resolveNativeSubagentSupportStatus({
+      payload: { omx_runtime_capabilities: { native_subagents: true, multi_agent_v1: true, role_routing: false } },
+    });
+    assert.equal(capabilityEvidence.status, 'role_routing_unavailable');
+    assert.equal(capabilityEvidence.source, 'hook_payload_capability');
+    assert.equal(isRoleRoutingUnavailableEvidence(capabilityEvidence), true);
+    assert.equal(isUnsupportedNativeSubagentEvidence(capabilityEvidence), false);
+
+    const marker: RoleRoutingUnavailableMarker = {
+      schema_version: 1,
+      cwd: '/repo',
+      session_id: 'sess-1',
+      parent_thread_id: 'parent-1',
+      observed_at: '2026-07-09T00:00:00.000Z',
+      expires_at: '2026-07-10T00:00:00.000Z',
+      evidence: 'spawn tool accepted no native role routing',
+    };
+    const markerEvidence = resolveNativeSubagentSupportStatus({
+      cwd: '/repo',
+      sessionId: 'sess-1',
+      nowMs: Date.parse('2026-07-09T12:00:00.000Z'),
+      persistedRoleRoutingMarker: marker,
+    });
+    assert.equal(markerEvidence.status, 'role_routing_unavailable');
+    assert.equal(markerEvidence.source, 'persisted_role_routing_marker');
+    assert.equal(markerEvidence.evidenceSummary, marker.evidence);
+  });
+
+  it('renders role-routing guidance that fails closed without adapted authority', () => {
+    const guidance = buildRoleRoutingUnavailableGuidance({
+      status: 'role_routing_unavailable',
+      source: 'persisted_role_routing_marker',
+      evidenceSummary: 'spawn tool accepted no native role routing',
+    });
+    assert.match(guidance, /omx ralplan preflight --json/);
+    assert.match(guidance, /unsupported_documented_leader_proof/);
+    assert.match(guidance, /Do not fabricate agent_type/);
+    assert.doesNotMatch(guidance, /PROCEED|role-intent ledger/);
+    assert.match(guidance, /Evidence: spawn tool accepted no native role routing/);
+    assert.match(LEADER_CONDUCTOR_ROLE_ROUTING_DEGRADE_BLOCK, /reviewed alternative workflow/);
+  });
+
   it('recognizes namespaced collaboration spawn tools and rejects near-miss names (#3119)', () => {
     // Terminology drift: the current Codex App surface exposes delegation as
     // `collaboration.spawn_agent`. Presence of any namespaced spawn tool (or the
@@ -181,6 +240,67 @@ describe('leader conductor contract', () => {
       }).reason,
       'agent_thread_limit_reached',
     );
+  });
+
+  it('parses structured collaboration dispositions without child-output prose poisoning', () => {
+    for (const toolName of [
+      'collaboration.spawn_agent',
+      'collaboration.list_agents',
+      'collaboration.followup_task',
+      'collaboration.wait_agent',
+    ]) {
+      const disposition = parseNativeSubagentResultDisposition(toolName, {
+        success: true,
+        status: 'completed',
+        output: 'Child report: the optional plugin is unavailable, unsupported, and not found.',
+      });
+      assert.equal(disposition.kind, 'success', toolName);
+    }
+    assert.equal(parseNativeSubagentResultDisposition('collaboration.wait_agent', {
+      success: true,
+      status: 'completed',
+      error: null,
+      output: 'Child says optional support is unavailable.',
+    }).kind, 'success');
+  });
+
+  it('handles contradictory structured result fields deterministically', () => {
+    assert.equal(parseNativeSubagentResultDisposition('collaboration.wait_agent', {
+      success: true,
+      status: 'failed',
+      error: 'agent thread limit reached',
+    }).kind, 'capacity');
+    assert.equal(parseNativeSubagentResultDisposition('collaboration.followup_task', {
+      success: true,
+      status: 'failed',
+      error: 'unknown tool is unavailable',
+    }).kind, 'unsupported');
+  });
+
+  it('limits legacy prose classification to spawn results', () => {
+    assert.equal(
+      parseNativeSubagentResultDisposition('multi_agent_v1.spawn_agent', 'unknown tool is unavailable').kind,
+      'unsupported',
+    );
+    for (const toolName of [
+      'collaboration.list_agents',
+      'collaboration.followup_task',
+      'collaboration.wait_agent',
+    ]) {
+      assert.equal(
+        parseNativeSubagentResultDisposition(toolName, 'successful child output says a dependency is unavailable').kind,
+        'unknown',
+        toolName,
+      );
+    }
+  });
+
+  it('ignores structured failure prose from provably unrelated tools', () => {
+    assert.equal(parseNativeSubagentResultDisposition('Bash', {
+      success: false,
+      status: 'failed',
+      error: 'optional plugin is unsupported and unavailable',
+    }).kind, 'unknown');
   });
 
   it('recognizes scoped unsupported native blocker evidence and renders blocker guidance', () => {
@@ -312,5 +432,74 @@ describe('leader conductor contract', () => {
       }, { sessionId: 'sess-1' }),
       true,
     );
+  });
+  it('builds and parses App-compatible native role-intent task names', () => {
+    const taskName = buildRoleIntentSpawnTaskName('abc123');
+    assert.equal(taskName, 'omx_role_intent_abc123');
+    assert.equal(taskName, `${ROLE_INTENT_SPAWN_TASK_NAME_PREFIX}abc123`);
+    assert.match(taskName, NATIVE_SPAWN_TASK_NAME_PATTERN);
+
+    assert.equal(isAppCompatibleSpawnTaskName('omx-role-intent:9f8e'), false);
+    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_DEADBEEF'), false);
+    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_dead-beef'), false);
+    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_dead:beef'), false);
+    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_deadbeef'), true);
+    assert.equal(ROLE_INTENT_CORRELATION_TOKEN_PATTERN.test('abc123'), true);
+    assert.equal(ROLE_INTENT_CORRELATION_TOKEN_PATTERN.test('abc_def'), false);
+    assert.throws(() => buildRoleIntentSpawnTaskName('abc_def'), /Invalid role-intent correlation token/);
+
+    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_a3118'), 'a3118');
+    assert.equal(parseRoleIntentCorrelationToken(['omx_role_intent_a3118']), undefined);
+    assert.equal(parseRoleIntentCorrelationToken({ toString: () => 'omx_role_intent_a3118' }), undefined);
+    assert.equal(parseRoleIntentCorrelationToken(' omx_role_intent_a3118'), undefined);
+    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_a3118 '), undefined);
+    assert.equal(parseRoleIntentCorrelationToken('omx-role-intent:deadbeef'), undefined);
+    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_abc_def'), undefined);
+    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_DEADBEEF'), undefined);
+    assert.equal(parseRoleIntentCorrelationToken(''), undefined);
+    assert.equal(parseRoleIntentCorrelationToken(42), undefined);
+    assert.equal(parseRoleIntentCorrelationToken(null), undefined);
+    assert.equal(parseRoleIntentCorrelationToken(undefined), undefined);
+
+    const generatedTaskName = buildRoleIntentSpawnTaskName(randomUUID().replace(/-/g, ''));
+    assert.match(generatedTaskName, NATIVE_SPAWN_TASK_NAME_PATTERN);
+    assert.doesNotMatch(generatedTaskName, /[-:]/);
+  });
+
+  it('canonicalizes symlinked and nonexistent-leaf origins while rejecting ELOOP identities', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-contract-canonical-origin-'));
+    const realWorkspace = join(root, 'real-workspace');
+    const aliasWorkspace = join(root, 'alias-workspace');
+    const loopA = join(root, 'loop-a');
+    const loopB = join(root, 'loop-b');
+    try {
+      await mkdir(realWorkspace);
+      await symlink(realWorkspace, aliasWorkspace, 'dir');
+      await symlink('loop-a', loopA);
+      await symlink('loop-b', loopB);
+
+      assert.equal(
+        canonicalizeOriginCwd(join(aliasWorkspace, 'missing', 'leaf')),
+        canonicalizeOriginCwd(join(realWorkspace, 'missing', 'leaf')),
+      );
+      assert.equal(canonicalizeOriginCwd(loopA), null);
+      assert.equal(canonicalizeOriginCwd(loopB), null);
+      assert.equal(canonicalizeOriginCwd(undefined), null);
+      assert.equal(canonicalizeOriginCwd(''), null);
+
+      assert.equal(
+        resolveNativeSubagentSupportStatus({
+          cwd: aliasWorkspace,
+          persistedSupportBlocker: {
+            status: 'unsupported',
+            reason: 'multi_agent_v1_unavailable',
+            cwd: realWorkspace,
+          },
+        }).status,
+        'unsupported',
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

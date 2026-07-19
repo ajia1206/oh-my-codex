@@ -27,6 +27,7 @@ import { hudCommand } from "../hud/index.js";
 import { sidecarCommand } from "../sidecar/index.js";
 import { teamCommand } from "./team.js";
 import { ralphCommand } from "./ralph.js";
+import { ralplanCommand } from "./ralplan.js";
 import { ultragoalCommand } from "./ultragoal.js";
 import { performanceGoalCommand } from "./performance-goal.js";
 import { askCommand } from "./ask.js";
@@ -56,7 +57,10 @@ import { authCommand } from "./auth.js";
 import { identityCommand } from "./identity.js";
 import { appCommand } from "./app.js";
 import { missionCommand } from "./mission.js";
-import { runAuthHotswap } from "../auth/hotswap.js";
+import {
+  resolveCodexGlobalOptionValue,
+  runAuthHotswap,
+} from "../auth/hotswap.js";
 import { switchIdentitySlot, switchIdentitySlotToAuthPath } from "../auth/identity.js";
 import { resolveDefaultCodexHome } from "../auth/paths.js";
 import { readAuthMetadata } from "../auth/storage.js";
@@ -73,8 +77,10 @@ import {
 } from "./constants.js";
 import {
   getBaseStateDir,
+  getBaseStateDirWithSource,
   getStateDir,
   listModeStateFilesWithScopePreference,
+  resolveWritableStateScope,
   type ModeStateFileRef,
 } from "../mcp/state-paths.js";
 import { evaluateRalphCompletionAuditEvidence, isRalphCompletePhase } from "../ralph/completion-audit.js";
@@ -97,8 +103,9 @@ import {
 } from "./plugin-marketplace.js";
 import { escapeTomlString, readTopLevelTomlString, upsertTopLevelTomlString } from "../utils/toml.js";
 import {
-  CANONICAL_REASONING_EFFORTS,
-  isAmbiguousUnsupportedReasoningEffort,
+  ROOT_REASONING_EFFORTS,
+  isUnsupportedRootReasoningEffort,
+  normalizeUnsupportedRootReasoningEffort,
 } from "../config/models.js";
 
 
@@ -129,11 +136,14 @@ import {
   writeSessionModelInstructionsFile,
 } from "../hooks/agents-overlay.js";
 import {
+  isSessionPointerLaunchAbort,
+  normalizeSessionId,
   readSessionState,
   writeSessionStart,
   writeSessionEnd,
   resetSessionMetrics,
 } from "../hooks/session.js";
+import { probeActualTmuxInstanceEvidence, tmuxEvidenceBindsCandidate } from "../scripts/notify-hook/managed-tmux.js";
 import {
   buildClientAttachedReconcileHookName,
   buildReconcileHudResizeArgs,
@@ -189,8 +199,10 @@ import {
   parseTeamWorkerLaunchArgs,
   resolveTeamWorkerLaunchArgs,
   resolveTeamLowComplexityDefaultModel,
+  serializeTeamWorkerLaunchArgs,
   TEAM_WORKER_INHERITED_MODEL_ENV,
 } from "../team/model-contract.js";
+
 import {
   parseWorktreeMode,
   planWorktreeTarget,
@@ -261,6 +273,7 @@ Usage:
   omx explore   DEPRECATED compatibility command; use normal repo inspection or omx sparkshell
   omx api       Run native omx-api localhost gateway commands (serve|status|stop|generate)
   omx session   Search and summarize local session history (--codex-home <path> escape hatch)
+                Includes session lock inspect/recover diagnostics
   omx url       Passive URL reader (read <url> --json)
   omx capabilities
                 Lock/check deterministic configured tool, skill, agent, and observation surfaces
@@ -271,6 +284,7 @@ Usage:
                 Alias for agents-init (lightweight AGENTS bootstrap only)
   omx team      Spawn parallel worker panes in tmux and bootstrap inbox/task state
   omx ralph     Launch Codex with ralph persistence mode active
+  omx ralplan   Record validated role intents for adapted native subagent spawns
   omx ultragoal Create, resume, and checkpoint durable multi-goal plans over Codex goal mode
   omx performance-goal
                 Create, hand off, and gate evaluator-backed performance goals
@@ -325,8 +339,11 @@ Options:
                 Launch Codex in a git worktree (detached when no name is given)
   --force       Force reinstall (overwrite existing files)
   --merge-agents
-                Merge OMX-managed AGENTS.md sections into an existing AGENTS.md
-                instead of overwriting user-authored content
+                Merge OMX-managed AGENTS.md sections and persist that explicit policy for this project root
+  --no-merge-agents
+                Persist an explicit non-merge policy; current non-merge behavior remains contextual
+  --clear-merge-agents-policy
+                Clear the persisted AGENTS merge policy for this project root
   --dry-run     Show what would be done without doing it
   --plugin      Use Codex plugin delivery for omx setup and remove legacy OMX-managed user/project components
   --legacy      Use legacy setup delivery for omx setup, overriding persisted plugin mode
@@ -372,11 +389,17 @@ const OMX_RALPH_APPEND_INSTRUCTIONS_FILE_ENV =
   "OMX_RALPH_APPEND_INSTRUCTIONS_FILE";
 const OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE_ENV =
   "OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE";
-const REASONING_MODES = CANONICAL_REASONING_EFFORTS;
+const REASONING_MODES = ROOT_REASONING_EFFORTS;
 type ReasoningMode = (typeof REASONING_MODES)[number];
 const REASONING_MODE_SET = new Set<string>(REASONING_MODES);
 const REASONING_USAGE = "Usage: omx reasoning <low|medium|high|xhigh>";
-const AMBIGUOUS_REASONING_MESSAGE = 'Codex/OMX canonical highest reasoning effort is "xhigh"; "max" and "ultra" are not accepted aliases.';
+
+function unsupportedLaunchShorthandError(flag: "--max" | "--ultra"): Error {
+  const guidance = flag === "--max"
+    ? 'No --max shorthand exists; use agentReasoning for per-agent "max" or pass -c model_reasoning_effort=... directly to Codex.'
+    : '"ultra" is not an OMX root or per-agent reasoning value and is not an alias for "max".';
+  return new Error(`Unsupported OMX launch shorthand "${flag}".\n${guidance}\nRun "omx help" for usage.`);
+}
 
 const ALLOWED_SHELLS = new Set([
   "/bin/sh",
@@ -451,6 +474,10 @@ type CliCommand =
   | "codex-native-hook"
   | string;
 
+const RESUME_HELP = `Usage: omx resume [--project] [--codex-home <path>] [codex resume options]
+
+Read-only help does not prepare or launch a Codex session.`;
+
 const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "ask",
   "question",
@@ -481,6 +508,7 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "wiki",
   "mcp-serve",
   "ralph",
+  "ralplan",
   "ultragoal",
   "performance-goal",
   "resume",
@@ -495,6 +523,49 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
 export interface ResolvedCliInvocation {
   command: CliCommand;
   launchArgs: string[];
+}
+
+export type SetupMergeAgentsPolicyArg =
+  | { kind: "set"; value: boolean }
+  | { kind: "clear" }
+  | undefined;
+
+export function resolveSetupAgentsMergePolicyArg(args: string[]): SetupMergeAgentsPolicyArg {
+  let policy: SetupMergeAgentsPolicyArg;
+  const setPolicy = (next: Exclude<SetupMergeAgentsPolicyArg, undefined>, source: string): void => {
+    if (policy && (policy.kind !== next.kind || (policy.kind === "set" && next.kind === "set" && policy.value !== next.value))) {
+      throw new Error(`Conflicting setup AGENTS merge policy flags: ${source} conflicts with another merge policy selector.`);
+    }
+    policy = next;
+  };
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--merge-agents" || arg === "--no-merge-agents" || arg === "--clear-merge-agents-policy") {
+      const next = args[index + 1];
+      if (next && !next.startsWith("--")) {
+        throw new Error(`Setup AGENTS merge policy flags do not accept values: ${arg} ${next}`);
+      }
+      if (arg === "--merge-agents") {
+        setPolicy({ kind: "set", value: true }, arg);
+      } else if (arg === "--no-merge-agents") {
+        setPolicy({ kind: "set", value: false }, arg);
+      } else {
+        setPolicy({ kind: "clear" }, arg);
+      }
+    } else if (
+      arg.startsWith("--merge-agents=") ||
+      arg.startsWith("--no-merge-agents=") ||
+      arg.startsWith("--clear-merge-agents-policy=")
+    ) {
+      throw new Error(`Setup AGENTS merge policy flags do not accept values: ${arg}`);
+    }
+  }
+  return policy;
+}
+
+export function resolveSetupMergeAgentsArg(args: string[]): boolean | undefined {
+  const policy = resolveSetupAgentsMergePolicyArg(args);
+  return policy?.kind === "set" ? policy.value : undefined;
 }
 
 export function resolveSetupInstallModeArg(args: string[]): SetupInstallMode | undefined {
@@ -671,6 +742,18 @@ export function resolveSetupTeamModeArg(args: string[]): SetupTeamMode | undefin
   }
 
   return value;
+}
+
+function splitOmxArgsAtEndOfOptions(args: string[]): {
+  omxArgs: string[];
+  suffix: string[];
+} {
+  const endOfOptionsIndex = args.indexOf("--");
+  if (endOfOptionsIndex === -1) return { omxArgs: args, suffix: [] };
+  return {
+    omxArgs: args.slice(0, endOfOptionsIndex),
+    suffix: args.slice(endOfOptionsIndex),
+  };
 }
 
 export function resolveCliInvocation(args: string[]): ResolvedCliInvocation {
@@ -1173,14 +1256,15 @@ export interface ResumeCodexHomeSelection {
 }
 
 export function parseResumeCodexHomeSelection(args: string[]): ResumeCodexHomeSelection {
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
   const nextArgs: string[] = [];
   let explicitCodexHome: string | undefined;
   let projectOnly = false;
 
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
+  for (let index = 0; index < omxArgs.length; index += 1) {
+    const arg = omxArgs[index];
     if (arg === "--codex-home") {
-      const value = args[index + 1];
+      const value = omxArgs[index + 1];
       if (!value || value.startsWith("-")) {
         throw new Error("Missing value after --codex-home.");
       }
@@ -1203,7 +1287,7 @@ export function parseResumeCodexHomeSelection(args: string[]): ResumeCodexHomeSe
   }
 
   return {
-    args: nextArgs,
+    args: [...nextArgs, ...suffix],
     explicitCodexHome,
     projectOnly,
   };
@@ -1279,8 +1363,30 @@ export async function preflightResumeOmxPluginState(
   };
 }
 
-function isResumeCodexLaunch(args: string[]): boolean {
-  return args.includes("resume");
+export { CODEX_GLOBAL_OPTIONS_WITH_SPLIT_VALUE } from "../auth/hotswap.js";
+
+export function isResumeCodexLaunch(args: string[]): boolean {
+  const { omxArgs } = splitOmxArgsAtEndOfOptions(args);
+  for (let index = 0; index < omxArgs.length; index += 1) {
+    const arg = omxArgs[index];
+    const optionValue = resolveCodexGlobalOptionValue(arg);
+    if (optionValue?.valueArity === "single") {
+      if (!optionValue.attached) index += 1;
+      continue;
+    }
+    if (optionValue?.valueArity === "variadic") {
+      if (optionValue.attached) continue;
+      let nextIndex = index + 1;
+      while (nextIndex < omxArgs.length && !omxArgs[nextIndex]!.startsWith("-")) {
+        nextIndex += 1;
+      }
+      index = nextIndex - 1;
+      continue;
+    }
+    if (arg.startsWith("-")) continue;
+    return arg === "resume";
+  }
+  return false;
 }
 
 async function prepareResumeCodexHomeForLaunch(
@@ -1610,6 +1716,25 @@ function hasErrnoCode(error: unknown, code: string): boolean {
 
 function isMissingTmuxLaunchNoise(error: unknown): boolean {
   return error instanceof Error && /spawnSync tmux ENOENT/i.test(error.message);
+}
+
+function reportOrdinaryLaunchRootConflict(
+  error: unknown,
+  cwd: string,
+  ordinaryLaunch: boolean,
+): void {
+  if (!ordinaryLaunch || !isSessionPointerLaunchAbort(error)
+    || error.code !== "session_pointer_owner_conflict"
+    || getBaseStateDirWithSource(cwd).rootSource !== "cwd-default") return;
+
+  console.error(
+    "[omx] concurrent conversations in this checkout require distinct user-specified OMX_ROOT values.\n" +
+      "[omx] Choose a distinct directory and set OMX_ROOT before launching the additional conversation.\n" +
+      "[omx] POSIX: OMX_ROOT=\"$HOME/.omx/instances/second-conversation\" omx\n" +
+      "[omx] PowerShell: $env:OMX_ROOT = \"$HOME/.omx/instances/second-conversation\"; omx\n" +
+      "[omx] cmd.exe: set \"OMX_ROOT=%USERPROFILE%\\.omx\\instances\\second-conversation\" && omx\n" +
+      "[omx] The selected OMX_ROOT is used literally; OMX does not reroute or allocate one automatically.",
+  );
 }
 
 function logCliOperationFailure(error: unknown): void {
@@ -2223,13 +2348,27 @@ function launchArgRequestsDisposableWorktree(arg: string): boolean {
 }
 
 function launchArgsRequestMadmaxIsolation(launchArgs: readonly string[]): boolean {
-  return launchArgs.some(
-    (arg) => arg === MADMAX_FLAG || arg === MADMAX_SPARK_FLAG,
-  );
+  for (const arg of launchArgs) {
+    if (arg === "--") break;
+    if (arg === MADMAX_FLAG || arg === MADMAX_SPARK_FLAG) return true;
+  }
+  return false;
+}
+
+function launchArgsRequestAuthHotswap(launchArgs: readonly string[]): boolean {
+  for (const arg of launchArgs) {
+    if (arg === "--") break;
+    if (arg === "--hotswap") return true;
+  }
+  return false;
 }
 
 function launchArgsRequestDisposableWorktree(launchArgs: readonly string[]): boolean {
-  return launchArgs.some((arg) => launchArgRequestsDisposableWorktree(arg));
+  for (const arg of launchArgs) {
+    if (arg === "--") break;
+    if (launchArgRequestsDisposableWorktree(arg)) return true;
+  }
+  return false;
 }
 
 function clearInheritedMadmaxRootForDisposableWorktreeLaunch(
@@ -2692,6 +2831,7 @@ export async function main(args: string[]): Promise<void> {
     "sparkshell",
     "team",
     "ralph",
+    "ralplan",
     "ultragoal",
     "performance-goal",
     "session",
@@ -2711,10 +2851,11 @@ export async function main(args: string[]): Promise<void> {
   ]);
   const firstArg = args[0];
   const { command, launchArgs } = resolveCliInvocation(args);
-  const flags = new Set(args.filter((a) => a.startsWith("--")));
+  const { omxArgs } = splitOmxArgsAtEndOfOptions(args);
+  const flags = new Set(omxArgs.filter((arg) => arg.startsWith("--")));
   const options = {
     force: flags.has("--force"),
-    mergeAgents: flags.has("--merge-agents"),
+    mergeAgents: undefined,
     dryRun: flags.has("--dry-run"),
     verbose: flags.has("--verbose"),
     team: flags.has("--team"),
@@ -2725,12 +2866,22 @@ export async function main(args: string[]): Promise<void> {
     return;
   }
 
-  activateMadmaxIsolationIfNeeded(command, launchArgs, process.cwd(), process.env);
-
   try {
+    if (command === "session") {
+      await sessionCommand(args.slice(1));
+      return;
+    }
+
+    if (command === "resume" && launchArgs.some((arg) => arg === "--help" || arg === "-h")) {
+      console.log(RESUME_HELP);
+      return;
+    }
+
+    activateMadmaxIsolationIfNeeded(command, launchArgs, process.cwd(), process.env);
+
     switch (command) {
       case "launch":
-        if (launchArgs.includes("--hotswap")) {
+        if (launchArgsRequestAuthHotswap(launchArgs)) {
           await launchWithAuthHotswap(launchArgs);
         } else {
           await launchWithHud(launchArgs);
@@ -2747,6 +2898,7 @@ export async function main(args: string[]): Promise<void> {
         await setup({
           force: options.force,
           mergeAgents: options.mergeAgents,
+          mergeAgentsPolicy: resolveSetupAgentsMergePolicyArg(args.slice(1)),
           dryRun: options.dryRun,
           verbose: options.verbose,
           scope: resolveSetupScopeArg(args.slice(1)),
@@ -2848,14 +3000,14 @@ export async function main(args: string[]): Promise<void> {
       case "team":
         await teamCommand(args.slice(1), options);
         break;
-      case "session":
-        await sessionCommand(args.slice(1));
-        break;
       case "url":
         await urlCommand(args.slice(1));
         break;
       case "ralph":
         await ralphCommand(args.slice(1));
+        break;
+      case "ralplan":
+        await ralplanCommand(args.slice(1));
         break;
       case "ultragoal":
         await ultragoalCommand(args.slice(1));
@@ -3102,9 +3254,14 @@ async function reasoningCommand(args: string[]): Promise<void> {
   }
 
   if (!REASONING_MODE_SET.has(mode)) {
-    const guidance = isAmbiguousUnsupportedReasoningEffort(mode)
-      ? `${AMBIGUOUS_REASONING_MESSAGE}\n`
-      : "";
+    const unsupportedMode = isUnsupportedRootReasoningEffort(mode)
+      ? normalizeUnsupportedRootReasoningEffort(mode)
+      : undefined;
+    const guidance = unsupportedMode === "max"
+      ? `Reasoning mode "${mode}" is not supported by "omx reasoning".\nPer-agent "max" is configured with agentReasoning; direct -c model_reasoning_effort=... is passed to Codex and remains capability-dependent.\n`
+      : unsupportedMode === "ultra"
+        ? `Reasoning mode "${mode}" is not supported by OMX root or per-agent reasoning and is not an alias for "max".\nDirect -c model_reasoning_effort=... remains opaque Codex passthrough.\n`
+        : "";
     throw new Error(
       `${guidance}Invalid reasoning mode "${mode}". Expected one of: ${REASONING_MODES.join(", ")}.\n${REASONING_USAGE}`,
     );
@@ -3123,7 +3280,10 @@ async function reasoningCommand(args: string[]): Promise<void> {
 
 export async function launchWithAuthHotswap(args: string[]): Promise<void> {
   const launchCwd = process.cwd();
-  const parsedWorktree = parseWorktreeMode(args);
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
+  const parsedWorktree = parseWorktreeMode(omxArgs);
+  const hotswapArgs = [...parsedWorktree.remainingArgs, ...suffix];
+
   let cwd = launchCwd;
   let worktreeDirty = false;
   let ensuredLaunchWorktree: ReturnType<typeof ensureWorktree> | undefined;
@@ -3181,7 +3341,7 @@ export async function launchWithAuthHotswap(args: string[]): Promise<void> {
 
   const status = await runAuthHotswap({
     cwd,
-    argv: parsedWorktree.remainingArgs,
+    argv: hotswapArgs,
     lifecycle: {
       prepareCodexHomeForLaunch,
       preLaunch: (launchPath, sessionId, notifyTempContract, codexHomeOverride, enableAuthority) =>
@@ -3228,13 +3388,15 @@ export async function launchWithHud(args: string[]): Promise<void> {
   }
 
   const launchCwd = process.cwd();
-  const parsedWorktree = parseWorktreeMode(args);
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
+  const parsedWorktree = parseWorktreeMode(omxArgs);
   const notifyTempResult = resolveNotifyTempContract(
     parsedWorktree.remainingArgs,
     process.env,
   );
+  const passthroughArgs = [...notifyTempResult.passthroughArgs, ...suffix];
   const explicitLaunchPolicy = resolveEffectiveLeaderLaunchPolicyOverride(
-    notifyTempResult.passthroughArgs,
+    passthroughArgs,
     process.env,
   );
   const persistentCodexHomeForLaunch = resolveCodexHomeForLaunch(launchCwd, process.env);
@@ -3242,12 +3404,10 @@ export async function launchWithHud(args: string[]): Promise<void> {
     resolveTmuxAwareLaunchPolicy(explicitLaunchPolicy, isNativeWindows());
   const enableNotifyFallbackAuthority = launchPolicy === "direct";
   const workerSparkModel = resolveWorkerSparkModel(
-    notifyTempResult.passthroughArgs,
+    passthroughArgs,
     persistentCodexHomeForLaunch,
   );
-  let normalizedArgs = normalizeCodexLaunchArgs(
-    notifyTempResult.passthroughArgs,
-  );
+  let normalizedArgs = normalizeCodexLaunchArgs(passthroughArgs);
   let cwd = launchCwd;
   let worktreeDirty = false;
   let ensuredLaunchWorktree: ReturnType<typeof ensureWorktree> | undefined;
@@ -3277,7 +3437,7 @@ export async function launchWithHud(args: string[]): Promise<void> {
     }
   }
   const madmaxWorktreeRuntimeContext = captureMadmaxWorktreeRuntimeContext({
-    originalLaunchArgs: args,
+    originalLaunchArgs: omxArgs,
     worktreeEnabled: Boolean(parsedWorktree.mode.enabled && ensuredLaunchWorktree?.enabled),
     sourceCwd: launchCwd,
     worktreeCwd: ensuredLaunchWorktree?.enabled ? ensuredLaunchWorktree.worktreePath : undefined,
@@ -3337,7 +3497,24 @@ export async function launchWithHud(args: string[]): Promise<void> {
   try {
     await preLaunch(cwd, sessionId, notifyTempResult.contract, codexHomeOverride, enableNotifyFallbackAuthority, worktreeDirty);
   } catch (err) {
-    // preLaunch errors must NOT prevent Codex from starting
+    if (isSessionPointerLaunchAbort(err)) {
+      console.error(`[omx] session pointer launch aborted: ${err.code}`);
+      reportOrdinaryLaunchRootConflict(
+        err,
+        cwd,
+        cwd === launchCwd && !parsedWorktree.mode.enabled && !isResumeCodexLaunch(normalizedArgs),
+      );
+      await cleanupRuntimeCodexHome(
+        preparedCodexHome.runtimeCodexHomeForCleanup,
+        projectLocalCodexHomeForCleanup,
+      ).catch((cleanupErr) => {
+        console.error(
+          `[omx] preLaunch abort cleanup warning: ${cleanupErr instanceof Error ? cleanupErr.message : cleanupErr}`,
+        );
+      });
+      throw err;
+    }
+    // preLaunch errors after pointer commit must not prevent Codex from starting.
     console.error(
       `[omx] preLaunch warning: ${err instanceof Error ? err.message : err}`,
     );
@@ -3374,14 +3551,14 @@ export async function launchWithHud(args: string[]): Promise<void> {
 
 export async function execWithOverlay(args: string[]): Promise<void> {
   const launchCwd = process.cwd();
-  const parsedWorktree = parseWorktreeMode(args);
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
+  const parsedWorktree = parseWorktreeMode(omxArgs);
   const notifyTempResult = resolveNotifyTempContract(
     parsedWorktree.remainingArgs,
     process.env,
   );
-  const normalizedArgs = normalizeCodexLaunchArgs(
-    notifyTempResult.passthroughArgs,
-  );
+  const passthroughArgs = [...notifyTempResult.passthroughArgs, ...suffix];
+  const normalizedArgs = normalizeCodexLaunchArgs(passthroughArgs);
   let cwd = launchCwd;
   let worktreeDirty = false;
   let ensuredLaunchWorktree: ReturnType<typeof ensureWorktree> | undefined;
@@ -3452,6 +3629,18 @@ export async function execWithOverlay(args: string[]): Promise<void> {
   try {
     await preLaunch(cwd, sessionId, notifyTempResult.contract, codexHomeOverride, true, worktreeDirty);
   } catch (err) {
+    if (isSessionPointerLaunchAbort(err)) {
+      console.error(`[omx] session pointer launch aborted: ${err.code}`);
+      await cleanupRuntimeCodexHome(
+        preparedCodexHome.runtimeCodexHomeForCleanup,
+        projectLocalCodexHomeForCleanup,
+      ).catch((cleanupErr) => {
+        console.error(
+          `[omx] preLaunch abort cleanup warning: ${cleanupErr instanceof Error ? cleanupErr.message : cleanupErr}`,
+        );
+      });
+      throw err;
+    }
     console.error(
       `[omx] preLaunch warning: ${err instanceof Error ? err.message : err}`,
     );
@@ -3488,7 +3677,8 @@ export async function execWithOverlay(args: string[]): Promise<void> {
 }
 
 export function normalizeCodexLaunchArgs(args: string[]): string[] {
-  const parsed = parseWorktreeMode(args);
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
+  const parsed = parseWorktreeMode(omxArgs);
   const launchPolicyParsed = splitLeaderLaunchPolicyArgs(parsed.remainingArgs);
   const normalized: string[] = [];
   let wantsBypass = false;
@@ -3521,7 +3711,7 @@ export function normalizeCodexLaunchArgs(args: string[]): string[] {
     }
 
     if (arg === "--max" || arg === "--ultra") {
-      throw new Error(AMBIGUOUS_REASONING_MESSAGE);
+      throw unsupportedLaunchShorthandError(arg);
     }
 
     if (arg === SPARK_FLAG) {
@@ -3546,7 +3736,7 @@ export function normalizeCodexLaunchArgs(args: string[]): string[] {
     normalized.push(CONFIG_FLAG, `${REASONING_KEY}="${reasoningMode}"`);
   }
 
-  return normalized;
+  return [...normalized, ...suffix];
 }
 
 /**
@@ -3559,6 +3749,7 @@ export function resolveWorkerSparkModel(
   codexHomeOverride?: string,
 ): string | undefined {
   for (const arg of args) {
+    if (arg === "--") break;
     if (arg === SPARK_FLAG || arg === MADMAX_SPARK_FLAG) {
       return resolveTeamLowComplexityDefaultModel(codexHomeOverride);
     }
@@ -3656,6 +3847,24 @@ export function resolveNativeSessionName(
   return buildTmuxSessionName(cwd, sessionId);
 }
 
+async function resolvePreLaunchSessionPointerOptions(): Promise<{
+  ownerAliasVerified?: true;
+  tmuxSessionName?: string;
+  tmuxPaneId?: string;
+}> {
+  const ownerCandidate = normalizeSessionId(process.env.OMX_SESSION_ID);
+  if (!ownerCandidate) return {};
+
+  const evidence = await probeActualTmuxInstanceEvidence(process.env.TMUX_PANE);
+  if (!tmuxEvidenceBindsCandidate(evidence, ownerCandidate)) return {};
+
+  return {
+    ownerAliasVerified: true,
+    ...(evidence.sessionName ? { tmuxSessionName: evidence.sessionName } : {}),
+    ...(evidence.paneTarget ? { tmuxPaneId: evidence.paneTarget } : {}),
+  };
+}
+
 function tagTmuxSessionWithInstance(sessionName: string, sessionId: string): void {
   const target = sessionName.trim();
   const instanceId = sessionId.trim();
@@ -3723,11 +3932,13 @@ export function injectModelInstructionsBypassArgs(
   defaultFilePath?: string,
 ): string[] {
   if (!shouldBypassDefaultSystemPrompt(env)) return [...args];
-  if (hasModelInstructionsOverride(args)) return [...args];
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
+  if (hasModelInstructionsOverride(omxArgs)) return [...args];
   return [
-    ...args,
+    ...omxArgs,
     CONFIG_FLAG,
     buildModelInstructionsOverride(cwd, env, defaultFilePath),
+    ...suffix,
   ];
 }
 
@@ -3752,7 +3963,7 @@ export function resolveTeamWorkerLaunchArgsEnv(
     fallbackModel: defaultModel,
   });
   if (normalized.length === 0) return null;
-  return normalized.join(" ");
+  return serializeTeamWorkerLaunchArgs(normalized);
 }
 
 export { readTopLevelTomlString, upsertTopLevelTomlString } from "../utils/toml.js";
@@ -4299,6 +4510,15 @@ function buildTmuxExtendedKeysReleaseShellSnippet(cwd: string): string {
 }
 
 const SHELL_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const DETACHED_SESSION_PANE_ENV_KEYS = new Set([
+  "TERM",
+  "TERM_PROGRAM",
+  "TERM_PROGRAM_VERSION",
+  "TMUX",
+  "TMUX_PANE",
+  "COLUMNS",
+  "LINES",
+]);
 
 export function serializeDetachedSessionParentEnv(
   env: NodeJS.ProcessEnv,
@@ -4306,6 +4526,7 @@ export function serializeDetachedSessionParentEnv(
   const lines: string[] = [];
   for (const key of Object.keys(env).sort()) {
     if (!SHELL_ENV_NAME_PATTERN.test(key)) continue;
+    if (DETACHED_SESSION_PANE_ENV_KEYS.has(key)) continue;
     const value = env[key];
     if (typeof value !== "string") continue;
     if (value.includes("\0")) continue;
@@ -5113,8 +5334,8 @@ export async function reconcileLaunchIdentityMetadata(
 /**
  * preLaunch: Prepare environment before Codex starts.
  * 1. Best-effort launch-safe orphan cleanup for detached OMX MCP processes
- * 2. Generate runtime overlay + write session-scoped model instructions file
- * 3. Write session.json
+ * 2. Establish the canonical session pointer
+ * 3. Generate session-scoped launch artifacts and start best-effort helpers
  *
  * Automatic broad stale-session cleanup remains disabled here. Only detached
  * OMX MCP processes without a live Codex ancestor are reaped so new launches
@@ -5146,7 +5367,10 @@ export async function preLaunch(
     // Non-fatal
   }
 
-  // 2. Generate runtime overlay + write session-scoped model instructions file
+  // 2. Establish the canonical pointer before any session-scoped launch artifact.
+  await writeSessionStart(cwd, sessionId, await resolvePreLaunchSessionPointerOptions());
+
+  // 3. Generate runtime overlay + write session-scoped model instructions file
   const orchestrationMode = await resolveSessionOrchestrationMode(
     cwd,
     sessionId,
@@ -5164,9 +5388,8 @@ ${launchAppendix}${dirtyWorktreeGuidance}`
       : `${overlay}${dirtyWorktreeGuidance}`;
   await writeSessionModelInstructionsFile(cwd, sessionId, sessionInstructions);
 
-  // 3. Write session state
+  // 4. Reset session metrics and tag the established session.
   await resetSessionMetrics(cwd, sessionId);
-  await writeSessionStart(cwd, sessionId);
   try {
     await recordLaunchIdentityMetadata(cwd, sessionId, codexHomeOverride);
   } catch (err) {
@@ -5175,7 +5398,7 @@ ${launchAppendix}${dirtyWorktreeGuidance}`
   }
   tagCurrentTmuxSessionWithInstance(sessionId);
 
-  // 4. Start notify fallback watcher (best effort)
+  // 5. Start notify fallback watcher (best effort)
   try {
     await startNotifyFallbackWatcher(cwd, { codexHomeOverride, enableAuthority: enableNotifyFallbackAuthority, sessionId });
   } catch (err) {
@@ -5183,7 +5406,7 @@ ${launchAppendix}${dirtyWorktreeGuidance}`
     // Non-fatal
   }
 
-  // 5. Start derived watcher (best effort, opt-in)
+  // 6. Start derived watcher (best effort, opt-in)
   try {
     await startHookDerivedWatcher(cwd);
   } catch (err) {
@@ -5191,7 +5414,7 @@ ${launchAppendix}${dirtyWorktreeGuidance}`
     // Non-fatal
   }
 
-  // 6. Emit temp notification startup summary + warnings, then send session-start lifecycle notification (best effort)
+  // 7. Emit temp notification startup summary + warnings, then send session-start lifecycle notification (best effort)
   try {
     if (notifyTempContract?.active) {
       process.env[OMX_NOTIFY_TEMP_CONTRACT_ENV] =
@@ -5223,7 +5446,7 @@ ${launchAppendix}${dirtyWorktreeGuidance}`
     // Non-fatal: notification failures must never block launch
   }
 
-  // 7. Dispatch native hook event (best effort)
+  // 8. Dispatch native hook event (best effort)
   try {
     await emitNativeHookEvent(cwd, "session-start", {
       session_id: sessionId,
@@ -5791,8 +6014,9 @@ function encodePowerShellCommand(commandText: string): string {
   return Buffer.from(commandText, "utf16le").toString("base64");
 }
 
-function isCodexVersionRequest(args: string[]): boolean {
-  return args.some((arg) => CODEX_VERSION_FLAGS.has(arg));
+export function isCodexVersionRequest(args: string[]): boolean {
+  const { omxArgs } = splitOmxArgsAtEndOfOptions(args);
+  return omxArgs.some((arg) => CODEX_VERSION_FLAGS.has(arg));
 }
 
 export function buildWindowsPromptCommand(
@@ -6612,7 +6836,7 @@ async function flushNotifyFallbackOnce(
     {
       cwd,
       stdio: "ignore",
-      timeout: 3000,
+      timeout: 45_000,
       windowsHide: true,
       env: buildNotifyFallbackWatcherEnv(process.env, {
         codexHomeOverride: options.codexHomeOverride,
@@ -6755,6 +6979,7 @@ async function cancelModes(args: string[] = []): Promise<void> {
   const nowIso = new Date().toISOString();
   const force = args.includes("--force");
   try {
+    const writableScope = await resolveWritableStateScope(cwd);
     const loadStates = async (refs: ModeStateFileRef[]) => {
       const loaded = new Map<
       string,
@@ -6793,8 +7018,7 @@ async function cancelModes(args: string[] = []): Promise<void> {
       if (hasActiveWorkflowMode(runDirStates)) states = runDirStates;
     }
 
-    const currentSession = await readSessionState(cwd).catch(() => null);
-    const currentSessionId = typeof currentSession?.session_id === "string" ? currentSession.session_id.trim() : "";
+    const currentSessionId = writableScope.sessionId ?? "";
     const changed = new Set<string>();
     const reported = new Set<string>();
 

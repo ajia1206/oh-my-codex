@@ -2,7 +2,7 @@
 
 import { existsSync } from 'fs';
 import { appendFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'fs/promises';
-import { spawnSync } from 'child_process';
+import { spawn, type ChildProcess } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
 import { StringDecoder } from 'string_decoder';
@@ -26,7 +26,6 @@ import {
   maybeNudgeTeamLeader,
   resolveLeaderStalenessThresholdMs,
 } from './notify-hook/team-leader-nudge.js';
-import { resolveManagedPaneFromAnchor, resolveManagedSessionPane } from './notify-hook/managed-tmux.js';
 import { DEFAULT_MARKER } from './tmux-hook-engine.js';
 import { isTerminalPhase } from './notify-hook/utils.js';
 import { isSessionStale, isSessionStateAuthoritativeForCwd, readSessionState } from '../hooks/session.js';
@@ -39,6 +38,9 @@ import { sameFilePath } from '../utils/paths.js';
 import { validateSessionId } from '../mcp/state-paths.js';
 import { TEAM_NAME_SAFE_PATTERN } from '../team/contracts.js';
 import { shouldContinueRun } from '../runtime/run-loop.js';
+import { deliverNotifyFallback, compactNotifyFallbackDeliveries, NOTIFY_FALLBACK_LEASE_MS } from './notify-fallback-delivery.js';
+import { readExactPaneProofSync } from '../team/exact-pane.js';
+import { OMX_RALPH_PANE_OWNER_OPTION } from '../state/mode-state-context.js';
 
 function argValue(name: string, fallback = ''): string {
   const idx = process.argv.indexOf(name);
@@ -71,8 +73,12 @@ function normalizeValidTeamName(value: unknown): string {
 }
 
 function parsePositivePid(value: unknown): number | null {
-  const pid = Math.trunc(asNumber(value as string | number | undefined, 0));
-  return pid > 0 ? pid : null;
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? value : null;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!/^[1-9][0-9]*$/.test(trimmed)) return null;
+  const pid = Number(trimmed);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
 }
 
 function parseIsoMillis(value: string | null | undefined): number | null {
@@ -132,15 +138,18 @@ const parentPid = Math.trunc(asNumber(argValue('--parent-pid', String(process.pp
 const startedAt = Date.now();
 const fileWindowMs = runOnce ? 15000 : 30000;
 const defaultMaxLifetimeMs = 6 * 60 * 60 * 1000;
-const maxLifetimeMs = runOnce
-  ? 0
-  : Math.max(
-    pollMs,
-    asNumber(
-      argValue('--max-lifetime-ms', process.env.OMX_NOTIFY_FALLBACK_MAX_LIFETIME_MS || String(defaultMaxLifetimeMs)),
-      defaultMaxLifetimeMs
-    )
-  );
+const requestedMaxLifetimeMs = asNumber(
+  argValue('--max-lifetime-ms', process.env.OMX_NOTIFY_FALLBACK_MAX_LIFETIME_MS || String(defaultMaxLifetimeMs)),
+  defaultMaxLifetimeMs,
+);
+const configuredMaxLifetimeMs = Number.isSafeInteger(requestedMaxLifetimeMs) && requestedMaxLifetimeMs > 0
+  ? requestedMaxLifetimeMs
+  : defaultMaxLifetimeMs;
+const maxLifetimeMs = runOnce ? 0 : Math.max(pollMs, configuredMaxLifetimeMs);
+const authorityLifetimeMs = runOnce
+  ? NOTIFY_FALLBACK_LEASE_MS
+  : Math.min(Math.max(pollMs, configuredMaxLifetimeMs), 24 * 60 * 60 * 1000);
+const authorityDeadlineAtMs = startedAt + authorityLifetimeMs;
 
 const runtimeRoot = resolve(process.env.OMX_ROOT || process.env.OMX_STATE_ROOT || cwd);
 const omxDir = join(runtimeRoot, '.omx');
@@ -284,6 +293,28 @@ const fileState = new Map<string, WatcherFileMeta>();
 const seenTurnKeys = new Set<string>();
 let stopping = false;
 let shutdownPromise: Promise<void> | null = null;
+let activeNotifyHookChild: ChildProcess | null = null;
+let activeNotifyHookClose: Promise<{ status: number | null; signal: string | null }> | null = null;
+let activeNotifyHookTermination: Promise<boolean> | null = null;
+let activeDeliveryPromise: Promise<unknown> | null = null;
+async function terminateActiveNotifyHookChild(): Promise<boolean> {
+  if (activeNotifyHookTermination) return activeNotifyHookTermination;
+  const child = activeNotifyHookChild;
+  const close = activeNotifyHookClose;
+  if (!child || !close) return true;
+  activeNotifyHookTermination = (async () => {
+    child.kill('SIGTERM');
+    const termResult = await Promise.race([close.then(() => true), sleep(1_000).then(() => false)]);
+    if (termResult) return true;
+    child.kill('SIGKILL');
+    return Promise.race([close.then(() => true), sleep(2_000).then(() => false)]);
+  })();
+  try {
+    return await activeNotifyHookTermination;
+  } finally {
+    activeNotifyHookTermination = null;
+  }
+}
 const dispatchTickMax = Math.max(1, asNumber(argValue('--dispatch-max-per-tick', '5'), 5));
 let dispatchDrainRuns = 0;
 let lastDispatchDrain: DispatchDrainState = {
@@ -745,25 +776,55 @@ async function resolveActiveTeamState(): Promise<ActiveTeamResult> {
   };
 }
 
-async function emitRalphContinueSteer(paneId: string, message: string): Promise<void> {
-  const markedText = `${message} ${DEFAULT_MARKER}`;
-  await new Promise<void>((resolve) => {
-    const { result: typed } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, '-l', markedText], { encoding: 'utf-8' });
-    if (typed.error) throw new Error(typed.error.message);
-    if (typed.status !== 0) throw new Error((typed.stderr || typed.stdout || '').trim() || 'tmux send-keys failed');
-    setTimeout(resolve, 100);
-  });
-  await new Promise<void>((resolve) => {
-    const { result: submitA } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, 'C-m'], { encoding: 'utf-8' });
-    if (submitA.error) throw new Error(submitA.error.message);
-    if (submitA.status !== 0) throw new Error((submitA.stderr || submitA.stdout || '').trim() || 'tmux send-keys C-m failed');
-    setTimeout(resolve, 100);
-  });
-  const { result: submitB } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, 'C-m'], { encoding: 'utf-8' });
-  if (submitB.error) throw new Error(submitB.error.message);
-  if (submitB.status !== 0) {
-    throw new Error((submitB.stderr || submitB.stdout || '').trim() || 'tmux send-keys C-m failed');
+interface RalphContinuePaneBinding {
+  paneId: string;
+  panePid: number;
+  sessionName: string;
+  paneOwnerId: string;
+}
+
+function parseRalphContinuePaneBinding(state: Record<string, unknown> | null): RalphContinuePaneBinding | null {
+  const paneId = safeString(state?.tmux_pane_id).trim();
+  const panePid = parsePositivePid(state?.tmux_pane_pid);
+  const sessionName = safeString(state?.tmux_session_name).trim();
+  const paneOwnerId = safeString(state?.tmux_pane_owner_id).trim();
+  if (!/^%[0-9]+$/.test(paneId) || panePid === null || !sessionName || !paneOwnerId) return null;
+  if (paneOwnerId.startsWith('team:')) return null;
+  return { paneId, panePid, sessionName, paneOwnerId };
+}
+
+function requireFrozenRalphPaneBinding(binding: RalphContinuePaneBinding): void {
+  const initialProof = readExactPaneProofSync(binding.paneId);
+  if (initialProof.status !== 'live' || initialProof.pid !== binding.panePid) {
+    throw new Error(`persisted Ralph pane identity unavailable: ${binding.paneId}`);
   }
+  const session = spawnPlatformCommandSync('tmux', ['display-message', '-p', '-t', binding.paneId, '#S'], { encoding: 'utf-8' }).result;
+  if (session.error || session.status !== 0 || safeString(session.stdout).trim() !== binding.sessionName) {
+    throw new Error(`persisted Ralph pane session changed: ${binding.paneId}`);
+  }
+  const owner = spawnPlatformCommandSync('tmux', ['show-option', '-qv', '-p', '-t', binding.paneId, OMX_RALPH_PANE_OWNER_OPTION], { encoding: 'utf-8' }).result;
+  if (owner.error || owner.status !== 0 || safeString(owner.stdout).trim() !== binding.paneOwnerId) {
+    throw new Error(`persisted Ralph pane owner changed: ${binding.paneId}`);
+  }
+  const finalProof = readExactPaneProofSync(binding.paneId);
+  if (finalProof.status !== 'live' || finalProof.pid !== binding.panePid) {
+    throw new Error(`persisted Ralph pane identity changed: ${binding.paneId}`);
+  }
+}
+
+async function emitRalphContinueSteer(binding: RalphContinuePaneBinding, message: string): Promise<void> {
+  const markedText = `${message} ${DEFAULT_MARKER}`;
+  const sendKeys = (args: string[], failure: string): void => {
+    requireFrozenRalphPaneBinding(binding);
+    const { result } = spawnPlatformCommandSync('tmux', args, { encoding: 'utf-8' });
+    if (result.error) throw new Error(result.error.message);
+    if (result.status !== 0) throw new Error((result.stderr || result.stdout || '').trim() || failure);
+  };
+  sendKeys(['send-keys', '-t', binding.paneId, '-l', markedText], 'tmux send-keys failed');
+  await sleep(100);
+  sendKeys(['send-keys', '-t', binding.paneId, 'C-m'], 'tmux send-keys C-m failed');
+  await sleep(100);
+  sendKeys(['send-keys', '-t', binding.paneId, 'C-m'], 'tmux send-keys C-m failed');
 }
 
 async function readRalphSteerTimestamp(): Promise<string> {
@@ -1048,89 +1109,7 @@ async function writePidFileRecord(): Promise<void> {
   await writeFile(pidFilePath, JSON.stringify(nextRecord, null, 2)).catch(() => {});
 }
 
-async function buildWatcherManagedPayload(): Promise<Record<string, string> | null> {
-  const session = await readSessionState(cwd).catch(() => null);
-  const sessionId = safeString(session?.session_id).trim();
-  if (!sessionId || !session || isSessionStale(session)) return null;
-  return { session_id: sessionId };
-}
 
-async function persistReboundRalphPaneState(
-  statePath: string,
-  state: Record<string, unknown> | null,
-  paneId: string,
-  nowIso: string,
-): Promise<Record<string, unknown>> {
-  const latestState = await readFile(statePath, 'utf-8')
-    .then((content) => JSON.parse(content) as Record<string, unknown>)
-    .catch(() => null);
-  const nextState = {
-    ...((latestState && typeof latestState === 'object') ? latestState : (state || {})),
-    tmux_pane_id: paneId,
-    tmux_pane_set_at: nowIso,
-  };
-  const tmpPath = `${statePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
-  await writeFile(tmpPath, JSON.stringify(nextState, null, 2));
-  try {
-    await rename(tmpPath, statePath);
-  } catch (error) {
-    await unlink(tmpPath).catch(() => {});
-    throw error;
-  }
-  return nextState;
-}
-
-async function resolveRalphContinuePaneTarget(
-  activeRalph: ActiveModeResult,
-  nowIso: string,
-): Promise<{ paneId: string; state: Record<string, unknown> | null; reboundFrom: string }> {
-  const currentState = activeRalph.state && typeof activeRalph.state === 'object'
-    ? activeRalph.state as Record<string, unknown>
-    : null;
-  const anchorPaneId = safeString(currentState?.tmux_pane_id).trim();
-  if (!anchorPaneId) {
-    return {
-      paneId: '',
-      state: currentState,
-      reboundFrom: '',
-    };
-  }
-
-  const managedPayload = await buildWatcherManagedPayload();
-  if (!managedPayload) {
-    return {
-      paneId: anchorPaneId,
-      state: currentState,
-      reboundFrom: '',
-    };
-  }
-
-  let resolvedPaneId = await resolveManagedPaneFromAnchor(anchorPaneId, cwd, managedPayload, { allowTeamWorker: false });
-  if (!resolvedPaneId) {
-    resolvedPaneId = await resolveManagedSessionPane(cwd, managedPayload);
-  }
-  if (!resolvedPaneId) {
-    return {
-      paneId: '',
-      state: currentState,
-      reboundFrom: '',
-    };
-  }
-  if (resolvedPaneId === anchorPaneId) {
-    return {
-      paneId: resolvedPaneId,
-      state: currentState,
-      reboundFrom: '',
-    };
-  }
-
-  const updatedState = await persistReboundRalphPaneState(activeRalph.path, currentState, resolvedPaneId, nowIso);
-  return {
-    paneId: resolvedPaneId,
-    state: updatedState,
-    reboundFrom: anchorPaneId,
-  };
-}
 
 async function runRalphContinueSteerTick(): Promise<void> {
   const now = Date.now();
@@ -1191,24 +1170,27 @@ async function runRalphContinueSteerTick(): Promise<void> {
       return { sent: false, skipped: true };
     }
 
-    const resolvedPane = await resolveRalphContinuePaneTarget(activeRalph, nowIso);
-    activeRalph.state = resolvedPane.state;
-    const paneId = resolvedPane.paneId;
-    if (!paneId) {
-      lastRalphContinueSteer.last_reason = 'pane_missing';
+    const binding = parseRalphContinuePaneBinding(activeRalph.state);
+    if (!binding) {
+      lastRalphContinueSteer.last_reason = 'pane_binding_missing';
       lastRalphContinueSteer.pane_id = '';
       return { sent: false, skipped: true };
     }
-
-    const paneGuard = await checkPaneReadyForTeamSendKeys(paneId);
-    lastRalphContinueSteer.pane_id = paneId;
+    lastRalphContinueSteer.pane_id = binding.paneId;
+    try {
+      requireFrozenRalphPaneBinding(binding);
+    } catch (error) {
+      lastRalphContinueSteer.last_reason = 'pane_binding_changed';
+      lastRalphContinueSteer.last_error = error instanceof Error ? error.message : safeString(error);
+      return { sent: false, skipped: true };
+    }
+    const paneGuard = await checkPaneReadyForTeamSendKeys(binding.paneId, binding.paneId);
     lastRalphContinueSteer.pane_current_command = paneGuard.paneCurrentCommand || '';
     if (!paneGuard.ok) {
       lastRalphContinueSteer.last_reason = paneGuard.reason || 'pane_guard_blocked';
       return { sent: false, skipped: true };
     }
-
-    await emitRalphContinueSteer(paneId, RALPH_CONTINUE_TEXT);
+    await emitRalphContinueSteer(binding, RALPH_CONTINUE_TEXT);
     await writeRalphSteerTimestamp(nowIso);
     lastRalphContinueSteer.last_sent_at = nowIso;
     lastRalphContinueSteer.shared_last_sent_at = nowIso;
@@ -1217,8 +1199,7 @@ async function runRalphContinueSteerTick(): Promise<void> {
     await eventLog({
       type: 'ralph_continue_steer',
       reason: 'sent',
-      pane_id: paneId,
-      rebound_from: resolvedPane.reboundFrom || null,
+      pane_id: binding.paneId,
       state_path: activeRalph.path,
       current_phase: safeString(activeRalph.state?.current_phase) || null,
       cadence_ms: RALPH_CONTINUE_CADENCE_MS,
@@ -1485,6 +1466,8 @@ async function requestShutdown(reason: string, signal: string | null = null): Pr
   if (shutdownPromise) return shutdownPromise;
   stopping = true;
   shutdownPromise = (async () => {
+    await terminateActiveNotifyHookChild();
+    await activeDeliveryPromise?.catch(() => undefined);
     await writeState({ stop_reason: reason, stop_signal: signal, stopping: true });
     await eventLog({
       type: 'watcher_stop',
@@ -1633,10 +1616,13 @@ function turnKey(threadId: string, turnId: string): string {
   return `${threadId || 'no-thread'}|${turnId || 'no-turn'}`;
 }
 
-function buildNotifyPayload(threadId: string, turnId: string, lastMessage: string): Record<string, unknown> {
+async function buildNotifyPayload(threadId: string, turnId: string, lastMessage: string): Promise<Record<string, unknown>> {
+  const session = await readSessionState(cwd).catch(() => null);
+  const payloadSessionId = normalizeValidSessionId(session?.session_id) || threadId;
   return {
     type: 'agent-turn-complete',
     cwd,
+    session_id: payloadSessionId,
     'thread-id': threadId,
     'turn-id': turnId,
     'input-messages': ['[notify-fallback] synthesized from rollout task_complete'],
@@ -1645,25 +1631,48 @@ function buildNotifyPayload(threadId: string, turnId: string, lastMessage: strin
   };
 }
 
-async function invokeNotifyHook(payload: Record<string, unknown>, filePath: string): Promise<void> {
-  const result = spawnSync(process.execPath, [notifyScript, JSON.stringify(payload)], {
-    cwd,
-    encoding: 'utf-8',
-    env: {
-      ...process.env,
-      OMX_NOTIFY_HOOK_TRUSTED_MANAGED_CWD: cwd,
-    },
-    windowsHide: true,
-  });
-  const ok = result.status === 0;
-  await eventLog({
-    type: 'fallback_notify',
-    ok,
-    thread_id: (payload as Record<string, string>)['thread-id'],
-    turn_id: (payload as Record<string, string>)['turn-id'],
-    file: filePath,
-    reason: ok ? 'sent' : 'notify_hook_failed',
-    error: ok ? undefined : (result.stderr || result.stdout || '').trim().slice(0, 240),
+async function invokeNotifyHook(payload: Record<string, unknown>): Promise<{ spawned: boolean; childPid?: number; status?: number | null; signal?: string | null; error?: unknown; timedOut?: boolean; authorityDeadline?: boolean; terminationUnconfirmed?: boolean }> {
+  return new Promise((resolveInvoke) => {
+    let settled = false;
+    let spawned = false;
+    let timedOut = false;
+    let deadlineTimedOut = false;
+    const child = spawn(process.execPath, [notifyScript, JSON.stringify(payload)], {
+      cwd,
+      stdio: 'ignore',
+      env: { ...process.env, OMX_NOTIFY_HOOK_TRUSTED_MANAGED_CWD: cwd },
+      windowsHide: true,
+    });
+    const close = new Promise<{ status: number | null; signal: string | null }>((resolveClose) => {
+      child.once('close', (status, signal) => resolveClose({ status, signal }));
+    });
+    activeNotifyHookChild = child;
+    activeNotifyHookClose = close;
+    const finish = (result: { spawned: boolean; childPid?: number; status?: number | null; signal?: string | null; error?: unknown; timedOut?: boolean; authorityDeadline?: boolean; terminationUnconfirmed?: boolean }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hookTimeout);
+      clearTimeout(deadlineTimeout);
+      if (activeNotifyHookChild === child) {
+        activeNotifyHookChild = null;
+        activeNotifyHookClose = null;
+        activeNotifyHookTermination = null;
+      }
+      resolveInvoke(result);
+    };
+    const stopForTimeout = async (isDeadline: boolean) => {
+      if (settled) return;
+      if (isDeadline) deadlineTimedOut = true;
+      else timedOut = true;
+      const confirmed = await terminateActiveNotifyHookChild();
+      const closed = await Promise.race([close, sleep(2_000).then(() => null)]);
+      finish({ spawned: true, childPid: child.pid, status: closed?.status ?? null, signal: closed?.signal ?? null, timedOut, authorityDeadline: deadlineTimedOut, terminationUnconfirmed: !confirmed || closed === null, error: isDeadline ? new Error('authority_deadline') : new Error('hook_timeout') });
+    };
+    const hookTimeout = setTimeout(() => { void stopForTimeout(false); }, 10_000);
+    const deadlineTimeout = setTimeout(() => { void stopForTimeout(true); }, Math.max(0, authorityDeadlineAtMs - Date.now()));
+    child.once('error', (error) => finish({ spawned, childPid: child.pid, error }));
+    child.once('spawn', () => { spawned = true; });
+    void close.then(({ status, signal }) => finish({ spawned, childPid: child.pid, status, signal }));
   });
 }
 
@@ -1677,23 +1686,58 @@ async function processLine(meta: WatcherFileMeta, line: string, filePath: string
 
   if (!parsed || parsed.type !== 'event_msg' || !parsed.payload) return;
   if ((parsed.payload as Record<string, unknown>).type !== 'task_complete') return;
-
   const turnId = safeString((parsed.payload as Record<string, unknown>).turn_id);
-  if (!turnId) return;
-
   const evtTs = Date.parse(safeString(parsed.timestamp));
-  if (Number.isFinite(evtTs) && evtTs < startedAt - 3000) return;
-
   const key = turnKey(meta.threadId, turnId);
+  if (!turnId || !Number.isFinite(evtTs) || evtTs > Date.now() + 5 * 60 * 1000 || evtTs < startedAt - 3000) {
+    seenTurnKeys.add(key);
+    return;
+  }
   if (seenTurnKeys.has(key)) return;
-  seenTurnKeys.add(key);
-
-  const payload = buildNotifyPayload(
+  const payload = await buildNotifyPayload(
     meta.threadId,
     turnId,
-    safeString((parsed.payload as Record<string, unknown>).last_agent_message)
+    safeString((parsed.payload as Record<string, unknown>).last_agent_message),
   );
-  await invokeNotifyHook(payload, filePath);
+  let spawnResult: Awaited<ReturnType<typeof invokeNotifyHook>> | undefined;
+  const deliveryPromise = deliverNotifyFallback({
+    stateDir,
+    threadId: meta.threadId,
+    turnId,
+    eventTimestampMs: evtTs,
+    rolloutPath: filePath,
+    watcherMode: runOnce ? 'once' : 'persistent',
+    deadlineAtMs: authorityDeadlineAtMs,
+    stopping: () => stopping,
+    spawnHook: async () => {
+      spawnResult = await invokeNotifyHook(payload);
+      return spawnResult;
+    },
+  });
+  activeDeliveryPromise = deliveryPromise;
+  const result = await deliveryPromise.finally(() => {
+    if (activeDeliveryPromise === deliveryPromise) activeDeliveryPromise = null;
+  });
+  if (result.kind === 'retry_eligible' && !stopping && Date.now() + 250 < authorityDeadlineAtMs) {
+    await sleep(250);
+    await processLine(meta, line, filePath);
+    return;
+  }
+  seenTurnKeys.add(key);
+  if (result.kind !== 'acquired_effect') {
+    await eventLog({ type: 'fallback_notify_claim', thread_id: meta.threadId, turn_id: turnId, file: filePath, reason: 'reason' in result ? result.reason : result.kind, attempt: 'attempt' in result ? result.attempt : undefined });
+  }
+  if (spawnResult?.spawned) {
+    await eventLog({
+      type: 'fallback_notify',
+      ok: spawnResult.status === 0,
+      thread_id: meta.threadId,
+      turn_id: turnId,
+      file: filePath,
+      reason: spawnResult.status === 0 ? 'sent' : 'notify_hook_failed',
+      error: spawnResult.status === 0 ? undefined : String(spawnResult.error || '').slice(0, 240),
+    });
+  }
 }
 
 async function ensureTrackedFiles(): Promise<void> {
@@ -1794,6 +1838,20 @@ async function runLeaderNudgeTick(): Promise<boolean> {
       precomputed_leader_stale: null,
       last_tick_at: startedIso,
       last_error: 'worker_context',
+    };
+    return false;
+  }
+
+  const activeTeam = await resolveActiveTeamState();
+  if (!activeTeam.active) {
+    leaderNudgeRuns += 1;
+    lastLeaderNudge = {
+      enabled: true,
+      leader_only: true,
+      stale_threshold_ms: staleThresholdMs,
+      precomputed_leader_stale: false,
+      last_tick_at: startedIso,
+      last_error: `inactive_team:${activeTeam.reason}`,
     };
     return false;
   }
@@ -1916,6 +1974,9 @@ async function pumpTeamControlPlaneTick(): Promise<CycleActivitySummary> {
 
 
 async function runWatcherCycle(): Promise<number> {
+  await compactNotifyFallbackDeliveries(stateDir).catch(async (error) => {
+    await eventLog({ type: 'fallback_notify_claim', reason: 'compaction_io_skip', error: error instanceof Error ? error.message : String(error) });
+  });
   let processedRolloutCount = 0;
   if (authorityOnly) {
     const authorityBackoff = await resolveAuthorityPrimaryWatcherHealth();

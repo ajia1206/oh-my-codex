@@ -1,3 +1,57 @@
+import { realpathSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+
+export const NATIVE_SPAWN_TASK_NAME_PATTERN = /^[a-z0-9_]+$/;
+export const ROLE_INTENT_CORRELATION_TOKEN_PATTERN = /^[a-z0-9]+$/;
+export const ROLE_INTENT_SPAWN_TASK_NAME_PREFIX = 'omx_role_intent_';
+
+
+export function buildRoleIntentSpawnTaskName(correlationToken: string): string {
+  const normalizedCorrelationToken = correlationToken.trim();
+  if (!ROLE_INTENT_CORRELATION_TOKEN_PATTERN.test(normalizedCorrelationToken)) {
+    throw new Error('Invalid role-intent correlation token.');
+  }
+  return `${ROLE_INTENT_SPAWN_TASK_NAME_PREFIX}${normalizedCorrelationToken}`;
+}
+
+export function isAppCompatibleSpawnTaskName(taskName: string): boolean {
+  return NATIVE_SPAWN_TASK_NAME_PATTERN.test(taskName);
+}
+
+export function parseRoleIntentCorrelationToken(taskName: unknown): string | undefined {
+  if (typeof taskName !== 'string') return undefined;
+  if (!taskName.startsWith(ROLE_INTENT_SPAWN_TASK_NAME_PREFIX)) return undefined;
+  const correlationToken = taskName.slice(ROLE_INTENT_SPAWN_TASK_NAME_PREFIX.length);
+  return ROLE_INTENT_CORRELATION_TOKEN_PATTERN.test(correlationToken) ? correlationToken : undefined;
+}
+
+// Canonical origin-workspace identity for adapted role-intent journals. Existing paths
+// resolve symlinks; nonexistent leaves retain their suffix beneath a canonical ancestor.
+export function canonicalizeOriginCwd(cwd: string | undefined): string | null {
+  const trimmed = typeof cwd === 'string' ? cwd.trim() : '';
+  if (!trimmed) return null;
+  let resolved: string;
+  try {
+    resolved = resolve(trimmed);
+  } catch {
+    return null;
+  }
+  let prefix = resolved;
+  const suffix: string[] = [];
+  for (;;) {
+    try {
+      const real = realpathSync(prefix);
+      return suffix.length ? join(real, ...suffix) : real;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+      const parent = dirname(prefix);
+      if (parent === prefix) return resolved;
+      suffix.unshift(basename(prefix));
+      prefix = parent;
+    }
+  }
+}
+
 export const LEADER_CONDUCTOR_PHILOSOPHY =
   'Conductor Philosophy: The core principle of OMX is: You are the conductor, not the performer.';
 
@@ -28,7 +82,7 @@ export const LEADER_CONDUCTOR_REUSE_AND_LEDGER_GUIDANCE = [
   `- ${LEADER_CONDUCTOR_SILVER_RULE}`,
   ...LEADER_CONDUCTOR_REUSE_AND_LEDGER_RULES.map((line) => `- ${line}`),
 ].join('\n');
-export type NativeSubagentSupportStatus = 'supported' | 'unsupported' | 'unknown';
+export type NativeSubagentSupportStatus = 'supported' | 'unsupported' | 'unknown' | 'role_routing_unavailable';
 
 export type NativeSubagentUnsupportedReason =
   | 'native_subagents_unsupported'
@@ -40,6 +94,7 @@ export type NativeSubagentSupportEvidenceSource =
   | 'hook_payload_available_tools'
   | 'post_tool_failure'
   | 'persisted_support_blocker'
+  | 'persisted_role_routing_marker'
   | 'capacity_blocker'
   | 'default_unknown';
 
@@ -51,10 +106,26 @@ export interface NativeSubagentSupportEvidence {
   observedAt?: string;
   expiresAt?: string;
 }
+export type NativeSubagentResultDisposition =
+  | { kind: 'success'; evidenceSummary: string }
+  | { kind: 'capacity'; evidenceSummary: string }
+  | { kind: 'unsupported'; reason: Exclude<NativeSubagentUnsupportedReason, 'agent_thread_limit_reached'>; evidenceSummary: string }
+  | { kind: 'unknown'; evidenceSummary: string };
+
+export interface RoleRoutingUnavailableMarker {
+  schema_version: 1;
+  cwd?: string;
+  session_id?: string;
+  parent_thread_id?: string;
+  observed_at: string;
+  expires_at: string;
+  evidence?: string;
+}
 
 export interface NativeSubagentCapabilityInput {
   payload?: Record<string, unknown> | null;
   persistedSupportBlocker?: Record<string, unknown> | null;
+  persistedRoleRoutingMarker?: unknown;
   persistedCapacityBlocker?: Record<string, unknown> | null;
   nowMs?: number;
   cwd?: string;
@@ -77,6 +148,13 @@ export const LEADER_CONDUCTOR_UNSUPPORTED_NATIVE_DEGRADE_BLOCK = [
   'Do not call multi_agent_v1.close_agent after native subagent capacity/support failures; stale native handles can hang the turn.',
 ].join(' ');
 
+export const LEADER_CONDUCTOR_ROLE_ROUTING_DEGRADE_BLOCK = [
+  'Native role routing is unavailable in this environment.',
+  'Do not fabricate agent_type or use adapted role intents, task-name carriers, markers, or prompt labels as authority.',
+  'Before Ralplan planner, reviewer, HUD, runtime, or delegation work, run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`.',
+  'Use a surface with installed typed agent_type routing or a reviewed alternative workflow.',
+].join(' ');
+
 function supportRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -94,6 +172,78 @@ function supportBoolean(value: unknown): boolean | null {
 function supportArray(value: unknown): unknown[] | null {
   return Array.isArray(value) ? value : null;
 }
+function stringifySupportValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function parseSupportRecord(value: unknown): Record<string, unknown> | null {
+  const direct = supportRecord(value);
+  if (direct) return direct;
+  if (typeof value !== 'string') return null;
+  try {
+    return supportRecord(JSON.parse(value));
+  } catch {
+    return null;
+  }
+}
+
+function nativeSubagentFailureDisposition(evidence: string): NativeSubagentResultDisposition | null {
+  if (/\bagent thread limit reached\b/i.test(evidence)) {
+    return { kind: 'capacity', evidenceSummary: evidence };
+  }
+  if (/\bnative subagents? (?:unsupported|disabled|not enabled|unavailable|not found)\b/i.test(evidence)) {
+    return { kind: 'unsupported', reason: 'native_subagents_unsupported', evidenceSummary: evidence };
+  }
+  if (/\bmulti_agent_v1\b/i.test(evidence) && /\b(?:unavailable|unknown tool|disabled|not enabled|not found|unsupported)\b/i.test(evidence)) {
+    return { kind: 'unsupported', reason: 'multi_agent_v1_unavailable', evidenceSummary: evidence };
+  }
+  if (/\b(?:unknown tool|tool not found|not enabled|disabled|unavailable|unsupported)\b/i.test(evidence)) {
+    return { kind: 'unsupported', reason: 'multi_agent_v1_unavailable', evidenceSummary: evidence };
+  }
+  return null;
+}
+
+export function parseNativeSubagentResultDisposition(
+  toolName: string,
+  value: unknown,
+): NativeSubagentResultDisposition {
+  const evidenceSummary = stringifySupportValue(value).replace(/\s+/g, ' ').trim();
+  if (toolName && !isNativeSubagentResultToolName(toolName)) {
+    return { kind: 'unknown', evidenceSummary };
+  }
+  const record = parseSupportRecord(value);
+  if (record) {
+    const status = supportString(record.status).toLowerCase();
+    const explicitFailure = record.success === false
+      || record.ok === false
+      || record.is_error === true
+      || record.isError === true
+      || (record.error !== undefined && record.error !== null && record.error !== '')
+      || ['error', 'failed', 'failure', 'unsupported', 'unavailable'].includes(status);
+    const explicitSuccess = record.success === true
+      || record.ok === true
+      || record.is_error === false
+      || record.isError === false
+      || ['ok', 'success', 'succeeded', 'completed', 'finished'].includes(status);
+    if (explicitFailure) {
+      return nativeSubagentFailureDisposition(evidenceSummary)
+        ?? { kind: 'unknown', evidenceSummary };
+    }
+    if (explicitSuccess) return { kind: 'success', evidenceSummary };
+    return { kind: 'unknown', evidenceSummary };
+  }
+
+  if (toolName && !isNativeSubagentSpawnToolName(toolName)) return { kind: 'unknown', evidenceSummary };
+
+  return nativeSubagentFailureDisposition(evidenceSummary)
+    ?? { kind: 'unknown', evidenceSummary };
+}
 
 function isNativeSubagentUnsupportedReason(value: unknown): value is NativeSubagentUnsupportedReason {
   return typeof value === 'string'
@@ -102,7 +252,7 @@ function isNativeSubagentUnsupportedReason(value: unknown): value is NativeSubag
 
 function isNativeSubagentSupportEvidenceSource(value: unknown): value is NativeSubagentSupportEvidenceSource {
   return typeof value === 'string'
-    && ['hook_payload_capability', 'hook_payload_available_tools', 'post_tool_failure', 'persisted_support_blocker', 'capacity_blocker', 'default_unknown'].includes(value);
+    && ['hook_payload_capability', 'hook_payload_available_tools', 'post_tool_failure', 'persisted_support_blocker', 'persisted_role_routing_marker', 'capacity_blocker', 'default_unknown'].includes(value);
 }
 
 function blockerMatchesScope(blocker: Record<string, unknown>, input: NativeSubagentCapabilityInput): boolean {
@@ -112,7 +262,7 @@ function blockerMatchesScope(blocker: Record<string, unknown>, input: NativeSuba
     if (!Number.isFinite(expiresAtMs) || expiresAtMs <= (input.nowMs ?? Date.now())) return false;
   }
   const blockerCwd = supportString(blocker.cwd);
-  if (blockerCwd && (!input.cwd || blockerCwd !== input.cwd)) return false;
+  if (blockerCwd && (!input.cwd || canonicalizeOriginCwd(blockerCwd) !== canonicalizeOriginCwd(input.cwd))) return false;
   const blockerSessionId = supportString(blocker.session_id ?? blocker.sessionId);
   if (blockerSessionId && (!input.sessionId || blockerSessionId !== input.sessionId)) return false;
   return true;
@@ -160,11 +310,39 @@ function supportEvidenceFromBlocker(
   };
 }
 
+function roleRoutingUnavailableEvidenceFromMarker(
+  marker: unknown,
+  input: NativeSubagentCapabilityInput,
+): NativeSubagentSupportEvidence | null {
+  const record = supportRecord(marker);
+  if (!record || record.schema_version !== 1 || !blockerMatchesScope(record, input)) return null;
+
+  const markerCwd = supportString(record.cwd);
+  const markerSessionId = supportString(record.session_id ?? record.sessionId);
+  if (!markerCwd && !markerSessionId) return null;
+
+  const observedAt = supportString(record.observed_at ?? record.observedAt);
+  if (!observedAt || !Number.isFinite(Date.parse(observedAt))) return null;
+  const expiresAt = supportString(record.expires_at ?? record.expiresAt);
+  const expiresAtMs = Date.parse(expiresAt);
+  if (!expiresAt || !Number.isFinite(expiresAtMs) || expiresAtMs <= (input.nowMs ?? Date.now())) return null;
+
+  return {
+    status: 'role_routing_unavailable',
+    source: 'persisted_role_routing_marker',
+    ...(supportString(record.evidence ?? record.evidenceSummary) ? { evidenceSummary: supportString(record.evidence ?? record.evidenceSummary) } : {}),
+    observedAt,
+    expiresAt,
+  };
+}
+
 function capabilityStatusFromRecord(record: Record<string, unknown> | null): NativeSubagentSupportStatus | null {
   if (!record) return null;
   const nativeSubagents = supportBoolean(record.native_subagents ?? record.nativeSubagents);
   const multiAgent = supportBoolean(record.multi_agent_v1 ?? record.multiAgentV1);
+  const roleRouting = supportBoolean(record.role_routing ?? record.roleRouting);
   if (nativeSubagents === false || multiAgent === false) return 'unsupported';
+  if (roleRouting === false) return 'role_routing_unavailable';
   if (nativeSubagents === true || multiAgent === true) return 'supported';
   return null;
 }
@@ -180,8 +358,14 @@ const NATIVE_SUBAGENT_SPAWN_TOOL_PATTERN = /(?:^|\.)spawn_agent$/;
 // `spawn_agent`, and namespaced forms such as `multi_agent_v1.spawn_agent` and
 // the current Codex App `collaboration.spawn_agent`, plus the legacy `task`
 // alias. The suffix anchor keeps `respawn_agent`/`spawn_agentx` from matching.
-function isNativeSubagentSpawnToolName(name: string): boolean {
+export function isNativeSubagentSpawnToolName(name: string): boolean {
   return NATIVE_SUBAGENT_SPAWN_TOOL_PATTERN.test(name) || name === 'task';
+}
+
+const NATIVE_SUBAGENT_RESULT_TOOL_PATTERN = /(?:^|\.)(?:spawn_agent|list_agents|followup_task|wait_agent)$/;
+
+export function isNativeSubagentResultToolName(name: string): boolean {
+  return NATIVE_SUBAGENT_RESULT_TOOL_PATTERN.test(name) || name === 'task';
 }
 
 function availableToolsEvidence(payload: Record<string, unknown> | null): NativeSubagentSupportEvidence | null {
@@ -224,6 +408,16 @@ export function resolveNativeSubagentSupportStatus(input: NativeSubagentCapabili
       evidenceSummary: 'payload capability reports native subagent support',
     };
   }
+  if (explicitStatus === 'role_routing_unavailable') {
+    return {
+      status: 'role_routing_unavailable',
+      source: 'hook_payload_capability',
+      evidenceSummary: 'payload capability reports role routing unavailable',
+    };
+  }
+
+  const roleRoutingMarkerEvidence = roleRoutingUnavailableEvidenceFromMarker(input.persistedRoleRoutingMarker, input);
+  if (roleRoutingMarkerEvidence) return roleRoutingMarkerEvidence;
 
   const toolEvidence = availableToolsEvidence(payload);
   if (toolEvidence?.status === 'supported') return toolEvidence;
@@ -255,10 +449,21 @@ export function isUnsupportedNativeSubagentEvidence(value: unknown): boolean {
   return isUnsupportedNativeSubagentEvidenceForScope(value);
 }
 
+export function isRoleRoutingUnavailableEvidence(value: unknown): boolean {
+  const record = supportRecord(value);
+  return record?.status === 'role_routing_unavailable';
+}
+
 export function buildUnsupportedNativeSubagentGuidance(evidence: NativeSubagentSupportEvidence): string {
   const reason = evidence.reason ? ` Reason: ${evidence.reason}.` : '';
   const summary = evidence.evidenceSummary ? ` Evidence: ${evidence.evidenceSummary}.` : '';
   return `${LEADER_CONDUCTOR_UNSUPPORTED_NATIVE_DEGRADE_BLOCK}${reason}${summary}`;
+}
+
+export function buildRoleRoutingUnavailableGuidance(evidence: NativeSubagentSupportEvidence): string {
+  const reason = evidence.reason ? ` Reason: ${evidence.reason}.` : '';
+  const summary = evidence.evidenceSummary ? ` Evidence: ${evidence.evidenceSummary}.` : '';
+  return `${LEADER_CONDUCTOR_ROLE_ROUTING_DEGRADE_BLOCK}${reason}${summary}`;
 }
 
 export type ConductorPhase =
